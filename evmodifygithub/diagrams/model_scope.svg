@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="820" viewBox="0 0 1600 820" role="img" aria-labelledby="title description">
+  <title id="title">EV MODIFY model scope</title>
+  <desc id="description">A layered diagram showing measured inputs, persisted state, the implemented conservative reduced electrochemical surrogate, outputs and validation boundary.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto"><path d="M0,0 L11,5.5 L0,11 Z" fill="#263238"/></marker>
+    <style>
+      .title { font: 700 38px Arial, sans-serif; fill: #102a43; }
+      .heading { font: 700 23px Arial, sans-serif; fill: #102a43; }
+      .text { font: 18px Arial, sans-serif; fill: #334e68; }
+      .caption { font: 16px Arial, sans-serif; fill: #486581; }
+      .arrow { stroke: #263238; stroke-width: 4; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1600" height="820" fill="#fbfdff"/>
+  <text x="80" y="70" class="title">EV MODIFY — model scope and evidence boundary</text>
+
+  <rect x="80" y="145" width="310" height="530" rx="20" fill="#d9eefc" stroke="#1f77b4" stroke-width="3"/>
+  <text x="235" y="193" text-anchor="middle" class="heading">Measured / configured inputs</text>
+  <text x="125" y="250" class="text">• Pack charge current</text>
+  <text x="125" y="292" class="text">• Cell temperature</text>
+  <text x="125" y="334" class="text">• Initial SOC estimate</text>
+  <text x="125" y="376" class="text">• SOH / capacity / resistance</text>
+  <text x="125" y="418" class="text">• Thermal geometry</text>
+  <text x="125" y="460" class="text">• Electrode parameters</text>
+  <line x1="115" y1="505" x2="355" y2="505" stroke="#1f77b4" stroke-width="2"/>
+  <text x="125" y="545" class="caption">Inputs require calibration and</text>
+  <text x="125" y="570" class="caption">plausibility checks on hardware.</text>
+
+  <rect x="505" y="115" width="570" height="590" rx="20" fill="#fff6df" stroke="#d99b00" stroke-width="3"/>
+  <text x="790" y="163" text-anchor="middle" class="heading">Implemented conservative reduced surrogate</text>
+  <rect x="560" y="205" width="460" height="92" rx="12" fill="#fff" stroke="#d99b00" stroke-width="2"/>
+  <text x="790" y="242" text-anchor="middle" class="text">Persisted SOC and analytical lumped thermal update</text>
+  <text x="790" y="270" text-anchor="middle" class="caption">Coulomb counting + Joule heating + convection</text>
+  <rect x="560" y="330" width="460" height="92" rx="12" fill="#fff" stroke="#d99b00" stroke-width="2"/>
+  <text x="790" y="367" text-anchor="middle" class="text">First-order spherical-particle surface-SOC correction</text>
+  <text x="790" y="395" text-anchor="middle" class="caption">Temperature-adjusted solid diffusivity</text>
+  <rect x="560" y="455" width="460" height="92" rx="12" fill="#fff" stroke="#d99b00" stroke-width="2"/>
+  <text x="790" y="492" text-anchor="middle" class="text">Inverse Butler–Volmer + electrolyte potential drop</text>
+  <text x="790" y="520" text-anchor="middle" class="caption">Used as an electrochemical margin surrogate</text>
+  <rect x="560" y="580" width="460" height="75" rx="12" fill="#fff" stroke="#d99b00" stroke-width="2"/>
+  <text x="790" y="625" text-anchor="middle" class="text">Per-cell constraint evaluation and bounded current search</text>
+
+  <rect x="1190" y="145" width="330" height="245" rx="20" fill="#e8f5e9" stroke="#2e8b57" stroke-width="3"/>
+  <text x="1355" y="193" text-anchor="middle" class="heading">Implemented outputs</text>
+  <text x="1235" y="250" class="text">• Approved charge current</text>
+  <text x="1235" y="292" class="text">• Limiting cell index</text>
+  <text x="1235" y="334" class="text">• Predicted margin / SOC / T</text>
+  <text x="1235" y="376" class="text">• ALLOW, LIMIT, or FAULT</text>
+
+  <rect x="1190" y="455" width="330" height="220" rx="20" fill="#fde8e8" stroke="#c53030" stroke-width="3"/>
+  <text x="1355" y="503" text-anchor="middle" class="heading">Not yet demonstrated</text>
+  <text x="1235" y="555" class="text">• Plating validation</text>
+  <text x="1235" y="595" class="text">• Cell-specific calibration</text>
+  <text x="1235" y="635" class="text">• Vehicle safety certification</text>
+
+  <path d="M390 410 H505" class="arrow"/>
+  <path d="M1075 300 H1190" class="arrow"/>
+  <path d="M1075 560 H1190" class="arrow"/>
+  <text x="1345" y="725" text-anchor="middle" class="caption">The strongest claim is adaptive, testable research software —</text>
+  <text x="1345" y="750" text-anchor="middle" class="caption">not an experimentally validated plating detector.</text>
+</svg>

@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="680" viewBox="0 0 1600 680" role="img" aria-labelledby="title description">
+  <title id="title">EV MODIFY validation roadmap</title>
+  <desc id="description">A five-stage roadmap from software prototype through calibration, experimental validation, embedded engineering and a safety case.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto"><path d="M0,0 L11,5.5 L0,11 Z" fill="#213547"/></marker>
+    <style>
+      .title { font: 700 38px Arial, sans-serif; fill: #102a43; }
+      .number { font: 700 34px Arial, sans-serif; fill: #fff; }
+      .heading { font: 700 21px Arial, sans-serif; fill: #102a43; }
+      .text { font: 17px Arial, sans-serif; fill: #334e68; }
+      .arrow { stroke: #213547; stroke-width: 4; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1600" height="680" fill="#f7fbff"/>
+  <text x="80" y="70" class="title">EV MODIFY — evidence roadmap from prototype to product candidate</text>
+  <line x1="150" y1="340" x2="1450" y2="340" stroke="#a0aec0" stroke-width="8" stroke-linecap="round"/>
+  <path d="M330 340 H405 M620 340 H695 M910 340 H985 M1200 340 H1275" class="arrow"/>
+
+  <g transform="translate(75 170)">
+    <circle cx="110" cy="170" r="54" fill="#1f77b4"/><text x="110" y="182" text-anchor="middle" class="number">1</text>
+    <rect x="0" y="250" width="220" height="160" rx="16" fill="#d9eefc" stroke="#1f77b4" stroke-width="3"/>
+    <text x="110" y="290" text-anchor="middle" class="heading">Software prototype</text>
+    <text x="110" y="325" text-anchor="middle" class="text">Strict build, tests,</text><text x="110" y="350" text-anchor="middle" class="text">deterministic limits</text>
+  </g>
+  <g transform="translate(365 170)">
+    <circle cx="110" cy="170" r="54" fill="#2e8b57"/><text x="110" y="182" text-anchor="middle" class="number">2</text>
+    <rect x="0" y="250" width="220" height="160" rx="16" fill="#e7f6e7" stroke="#2e8b57" stroke-width="3"/>
+    <text x="110" y="290" text-anchor="middle" class="heading">Cell calibration</text>
+    <text x="110" y="325" text-anchor="middle" class="text">Fit OCP, thermal,</text><text x="110" y="350" text-anchor="middle" class="text">kinetic and ageing data</text>
+  </g>
+  <g transform="translate(655 170)">
+    <circle cx="110" cy="170" r="54" fill="#d99b00"/><text x="110" y="182" text-anchor="middle" class="number">3</text>
+    <rect x="0" y="250" width="220" height="160" rx="16" fill="#fff2cc" stroke="#d99b00" stroke-width="3"/>
+    <text x="110" y="290" text-anchor="middle" class="heading">Experimental proof</text>
+    <text x="110" y="325" text-anchor="middle" class="text">Compare predictions</text><text x="110" y="350" text-anchor="middle" class="text">to measured degradation</text>
+  </g>
+  <g transform="translate(945 170)">
+    <circle cx="110" cy="170" r="54" fill="#7f3c8d"/><text x="110" y="182" text-anchor="middle" class="number">4</text>
+    <rect x="0" y="250" width="220" height="160" rx="16" fill="#f4e6ff" stroke="#7f3c8d" stroke-width="3"/>
+    <text x="110" y="290" text-anchor="middle" class="heading">Embedded delivery</text>
+    <text x="110" y="325" text-anchor="middle" class="text">MCU timing, HIL,</text><text x="110" y="350" text-anchor="middle" class="text">fault injection, CAN</text>
+  </g>
+  <g transform="translate(1235 170)">
+    <circle cx="110" cy="170" r="54" fill="#c53030"/><text x="110" y="182" text-anchor="middle" class="number">5</text>
+    <rect x="0" y="250" width="220" height="160" rx="16" fill="#fde8e8" stroke="#c53030" stroke-width="3"/>
+    <text x="110" y="290" text-anchor="middle" class="heading">Product safety case</text>
+    <text x="110" y="325" text-anchor="middle" class="text">Requirements, traceability,</text><text x="110" y="350" text-anchor="middle" class="text">independent assessment</text>
+  </g>
+  <text x="800" y="635" text-anchor="middle" class="text">EV MODIFY is currently at Stage 1. The value of the project is a disciplined path to evidence, not unsupported certification claims.</text>
+</svg>
