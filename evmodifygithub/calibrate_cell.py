@@ -1,155 +1,113 @@
+"""Fits the C model's lumped thermal parameters and ohmic resistance to measured data.
+
+Usage:
+    python calibrate_cell.py <test_data.csv>   # columns: time_s,current_A,temperature_C,voltage_V,initial_soc
+    python calibrate_cell.py                   # synthetic self-test (parameters must be recovered)
+
+Current is positive when charging. initial_soc is read from the first row.
+"""
+import sys
+
 import numpy as np
 from scipy.optimize import least_squares
-import csv
-import sys
-import os
 
-# Physical constants from the C model
+import ev_model as m
+
+# Must match spme_v7_apex_solver.h
 EV_CELL_MASS_KG = 0.070
 EV_CELL_COOLING_AREA_M2 = 0.0075
 EV_AMBIENT_TEMPERATURE_C = 25.0
-EV_FARADAY_C_PER_MOL = 96485.33212
-EV_GAS_J_PER_MOL_K = 8.31446262
-EV_REFERENCE_TEMPERATURE_K = 298.15
-EV_KINETIC_ACTIVATION_ENERGY_J_MOL = 30000.0
-EV_EXCHANGE_CURRENT_REF_A_M2 = 1.5
-EV_PARTICLE_RADIUS_M = 5.8e-6
-EV_GEOMETRIC_ELECTRODE_AREA_M2 = 0.100
-EV_ANODE_THICKNESS_M = 75.0e-6
 
-def ev_clamp(val, min_val, max_val):
-    return max(min_val, min(max_val, val))
+# Sensor noise used to weight the residuals (1 sigma)
+TEMPERATURE_NOISE_C = 0.2
+VOLTAGE_NOISE_V = 0.01
 
-def ev_graphite_ocp_V(theta):
-    bounded_theta = ev_clamp(theta, 0.001, 0.999)
-    return 0.0630 + 0.8000 * np.exp(-40.0 * bounded_theta) \
-        + 0.0650 * np.exp(-0.20 * (bounded_theta - 0.35)) \
-        - 0.0100 * np.log10(bounded_theta / (1.0 - bounded_theta))
+LOWER_BOUNDS = np.array([1.0, 100.0, 0.001])   # W/m2/K, J/kg/K, ohm
+UPPER_BOUNDS = np.array([50.0, 2000.0, 0.100])
 
-def ev_nmc_ocp_V(soc):
-    x = ev_clamp(soc, 0.001, 0.999)
-    return 3.43 + 0.67 * x - 0.45 * x * x
 
-def ev_full_cell_ocv_V(soc):
-    return ev_nmc_ocp_V(soc) - ev_graphite_ocp_V(soc)
-
-def simulate_cell(time_s, current_A, initial_soc, heat_transfer_W_m2_K, heat_capacity_J_kg_K, resistance_ohm):
-    """
-    Simulates the cell temperature and voltage given a current profile.
-    Returns predicted temperature and voltage arrays.
-    """
-    dt = time_s[1] - time_s[0]
-    n_steps = len(time_s)
-    
-    pred_temp = np.zeros(n_steps)
-    pred_voltage = np.zeros(n_steps)
-    
-    current_temp_C = EV_AMBIENT_TEMPERATURE_C
-    current_soc = initial_soc
-    
+def simulate_cell(time_s, current_A, initial_soc, initial_temp_C, heat_transfer_W_m2_K,
+                  heat_capacity_J_kg_K, resistance_ohm, capacity_Ah=m.NOMINAL_CAPACITY_AH):
+    """Same coulomb counting, lumped thermal update and OCV + IR voltage as the C model."""
     thermal_conductance_W_K = heat_transfer_W_m2_K * EV_CELL_COOLING_AREA_M2
     heat_capacity_J_K = EV_CELL_MASS_KG * heat_capacity_J_kg_K
-    
-    for i in range(n_steps):
-        I = current_A[i]
-        
-        # 1. Update SOC
-        current_soc += (I * dt) / (5.0 * 3600.0) # Nominal capacity 5Ah
-        current_soc = ev_clamp(current_soc, 0.0, 1.0)
-        
-        # 2. Update Temperature
-        joule_heat_W = I * I * resistance_ohm
-        temp_rise_steady = joule_heat_W / thermal_conductance_W_K
-        decay = np.exp(-(thermal_conductance_W_K * dt) / heat_capacity_J_K)
-        current_temp_C = EV_AMBIENT_TEMPERATURE_C + temp_rise_steady + (current_temp_C - EV_AMBIENT_TEMPERATURE_C - temp_rise_steady) * decay
-        
-        pred_temp[i] = current_temp_C
-        
-        # 3. Predict Voltage (Simplified for calibration: OCV + Ohmic)
-        # Note: A full DFN surrogate model includes polarization, but 
-        # OCV + Ohmic dominates the macro prediction.
-        pred_voltage[i] = ev_full_cell_ocv_V(current_soc) + I * resistance_ohm
-        
+
+    n_steps = len(time_s)
+    pred_temp = np.empty(n_steps)
+    soc = np.empty(n_steps)
+    pred_temp[0] = initial_temp_C
+    soc[0] = initial_soc
+    for i in range(1, n_steps):
+        dt = time_s[i] - time_s[i - 1]
+        current = current_A[i - 1]   # current applied over the interval
+        soc[i] = np.clip(soc[i - 1] + current * dt / (capacity_Ah * 3600.0), 0.0, 1.0)
+        steady_rise = current * current * resistance_ohm / thermal_conductance_W_K
+        decay = np.exp(-thermal_conductance_W_K * dt / heat_capacity_J_K)
+        pred_temp[i] = EV_AMBIENT_TEMPERATURE_C + steady_rise + (pred_temp[i - 1] - EV_AMBIENT_TEMPERATURE_C - steady_rise) * decay
+
+    pred_voltage = m.full_cell_ocv_V(soc) + current_A * resistance_ohm
     return pred_temp, pred_voltage
 
-def objective_function(params, time_s, current_A, meas_temp_C, meas_voltage_V, initial_soc):
-    heat_transfer = params[0]
-    heat_capacity = params[1]
-    resistance_ohm = params[2]
-    
-    pred_temp, pred_voltage = simulate_cell(
-        time_s, current_A, initial_soc, 
-        heat_transfer, heat_capacity, resistance_ohm
-    )
-    
-    # We want to minimize the error in both temperature and voltage
-    temp_error = (pred_temp - meas_temp_C) / np.std(meas_temp_C)
-    volt_error = (pred_voltage - meas_voltage_V) / np.std(meas_voltage_V)
-    
-    return np.concatenate((temp_error, volt_error))
+
+def residuals(scaled, time_s, current_A, meas_temp_C, meas_voltage_V, initial_soc):
+    heat_transfer, heat_capacity, resistance = scaled * (UPPER_BOUNDS - LOWER_BOUNDS) + LOWER_BOUNDS
+    pred_temp, pred_voltage = simulate_cell(time_s, current_A, initial_soc, meas_temp_C[0],
+                                            heat_transfer, heat_capacity, resistance)
+    return np.concatenate(((pred_temp - meas_temp_C) / TEMPERATURE_NOISE_C,
+                           (pred_voltage - meas_voltage_V) / VOLTAGE_NOISE_V))
+
+
+def calibrate(time_s, current_A, meas_temp, meas_volt, initial_soc, initial_guess=(10.0, 800.0, 0.015)):
+    guess_scaled = (np.asarray(initial_guess) - LOWER_BOUNDS) / (UPPER_BOUNDS - LOWER_BOUNDS)
+    result = least_squares(residuals, guess_scaled, bounds=(0.0, 1.0),
+                           args=(time_s, current_A, meas_temp, meas_volt, initial_soc), verbose=1)
+    params = result.x * (UPPER_BOUNDS - LOWER_BOUNDS) + LOWER_BOUNDS
+    rms_temp = np.sqrt(np.mean((result.fun[:len(time_s)] * TEMPERATURE_NOISE_C) ** 2))
+    rms_volt = np.sqrt(np.mean((result.fun[len(time_s):] * VOLTAGE_NOISE_V) ** 2))
+    return params, rms_temp, rms_volt
+
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python calibrate_cell.py <test_data.csv>")
-        print("Using synthetic data for self-test...")
-        
-        # Generate synthetic data
-        time_s = np.linspace(0, 3600, 360) # 1 hour, 10s steps
-        current_A = np.full_like(time_s, 5.0) # 1C charge
-        
-        true_ht = 15.0
-        true_hc = 900.0
+    true_params = None
+    if len(sys.argv) == 2:
+        data = np.genfromtxt(sys.argv[1], delimiter=",", names=True)
+        time_s = data["time_s"]
+        current_A = data["current_A"]
+        meas_temp = data["temperature_C"]
+        meas_volt = data["voltage_V"]
+        initial_soc = float(data["initial_soc"][0])
+    elif len(sys.argv) == 1:
+        print("No CSV given: running synthetic self-test.")
+        rng = np.random.default_rng(0)
+        time_s = np.linspace(0.0, 3600.0, 361)        # 1 h, 10 s steps
+        current_A = np.where(time_s < 2400.0, 5.0, 0.0)   # 1C charge then rest (makes R and h identifiable)
         initial_soc = 0.1
-        res_ohm = 0.015
-        
-        true_temp, true_volt = simulate_cell(time_s, current_A, initial_soc, true_ht, true_hc, res_ohm)
-        # Add noise
-        meas_temp = true_temp + np.random.normal(0, 0.2, len(true_temp))
-        meas_volt = true_volt + np.random.normal(0, 0.01, len(true_volt))
+        true_params = (15.0, 900.0, 0.015)
+        true_temp, true_volt = simulate_cell(time_s, current_A, initial_soc, EV_AMBIENT_TEMPERATURE_C, *true_params)
+        meas_temp = true_temp + rng.normal(0.0, TEMPERATURE_NOISE_C, time_s.size)
+        meas_volt = true_volt + rng.normal(0.0, VOLTAGE_NOISE_V, time_s.size)
     else:
-        # Load CSV
-        filename = sys.argv[1]
-        data = np.genfromtxt(filename, delimiter=',', names=True)
-        time_s = data['time_s']
-        current_A = data['current_A']
-        meas_temp = data['temperature_C']
-        meas_volt = data['voltage_V']
-        initial_soc = data['initial_soc'][0]
-        res_ohm = data['resistance_ohm'][0]
+        print(__doc__)
+        return 2
 
-    lower_bounds = np.array([1.0, 100.0, 0.001])
-    upper_bounds = np.array([50.0, 2000.0, 0.100])
-    
-    def scale_params(p):
-        return (p - lower_bounds) / (upper_bounds - lower_bounds)
-        
-    def unscale_params(p_scaled):
-        return p_scaled * (upper_bounds - lower_bounds) + lower_bounds
+    if np.any(np.diff(time_s) <= 0.0):
+        print("time_s must be strictly increasing")
+        return 2
 
-    initial_guess_scaled = scale_params(np.array([10.0, 800.0, 0.015]))
-    
-    def scaled_objective(p_scaled, *args):
-        p_real = unscale_params(p_scaled)
-        return objective_function(p_real, *args)
-        
-    bounds_scaled = ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0])
-    
-    print("Starting optimization (with scaled parameters)...")
-    res_scaled = least_squares(
-        scaled_objective, 
-        initial_guess_scaled, 
-        bounds=bounds_scaled,
-        args=(time_s, current_A, meas_temp, meas_volt, initial_soc),
-        verbose=1
-    )
-    
-    optimal_params = unscale_params(res_scaled.x)
-    
+    params, rms_temp, rms_volt = calibrate(time_s, current_A, meas_temp, meas_volt, initial_soc)
     print("\nCalibration Complete!")
-    print(f"Optimal Heat Transfer (W/m2/K): {optimal_params[0]:.3f}")
-    print(f"Optimal Heat Capacity (J/kg/K): {optimal_params[1]:.1f}")
-    print(f"Optimal Resistance (ohm): {optimal_params[2]:.4f}")
-    print(f"Cost (MSE): {res_scaled.cost:.4f}")
+    print(f"Heat transfer coefficient (W/m2/K): {params[0]:.3f}")
+    print(f"Specific heat capacity (J/kg/K):    {params[1]:.1f}")
+    print(f"Resistance (ohm):                   {params[2]:.4f}")
+    print(f"RMS residual: {rms_temp:.3f} degC, {rms_volt * 1000.0:.1f} mV")
 
-if __name__ == '__main__':
-    main()
+    if true_params is not None:
+        rel_err = np.abs(params - np.array(true_params)) / np.array(true_params)
+        ok = bool(np.all(rel_err < 0.05))
+        print("CALIBRATION SELF-TEST: " + ("PASS" if ok else "FAIL") + f" (max rel. error {rel_err.max():.2%})")
+        return 0 if ok else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

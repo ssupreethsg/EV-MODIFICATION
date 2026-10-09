@@ -25,22 +25,22 @@
   <rect x="350" y="230" width="210" height="180" rx="18" fill="#e7f6e7" stroke="#2e8b57" stroke-width="3"/>
   <text x="455" y="274" text-anchor="middle" class="box-title">Input gate</text>
   <text x="455" y="315" text-anchor="middle" class="box-text">Finite-range checks</text>
-  <text x="455" y="345" text-anchor="middle" class="box-text">Single current filter</text>
+  <text x="455" y="345" text-anchor="middle" class="box-text">Plausibility windows</text>
   <text x="455" y="375" text-anchor="middle" class="box-text">Sensor fault → FAULT</text>
 
   <rect x="630" y="190" width="250" height="260" rx="18" fill="#fff2cc" stroke="#d99b00" stroke-width="3"/>
   <text x="755" y="234" text-anchor="middle" class="box-title">Persisted cell state</text>
-  <text x="755" y="278" text-anchor="middle" class="box-text">SOC (coulomb counted)</text>
+  <text x="755" y="278" text-anchor="middle" class="box-text">SOC (EKF + coulomb count)</text>
   <text x="755" y="310" text-anchor="middle" class="box-text">Lumped temperature</text>
   <text x="755" y="342" text-anchor="middle" class="box-text">Capacity, resistance, SOH</text>
-  <text x="755" y="392" text-anchor="middle" class="small">State is committed only after</text>
-  <text x="755" y="416" text-anchor="middle" class="small">the approved current is selected.</text>
+  <text x="755" y="392" text-anchor="middle" class="small">Estimates absorb new measurements</text>
+  <text x="755" y="416" text-anchor="middle" class="small">before the current search runs.</text>
 
   <rect x="950" y="190" width="260" height="260" rx="18" fill="#f4e6ff" stroke="#7f3c8d" stroke-width="3"/>
   <text x="1080" y="234" text-anchor="middle" class="box-title">30-second predictor</text>
   <text x="1080" y="278" text-anchor="middle" class="box-text">Temperature + Joule heat</text>
   <text x="1080" y="310" text-anchor="middle" class="box-text">Surface-SOC surrogate</text>
-  <text x="1080" y="342" text-anchor="middle" class="box-text">Kinetic + electrolyte drop</text>
+  <text x="1080" y="342" text-anchor="middle" class="box-text">Kinetic + electrolyte losses</text>
   <text x="1080" y="392" text-anchor="middle" class="small">Evaluated separately for</text>
   <text x="1080" y="416" text-anchor="middle" class="small">every series cell.</text>
 
@@ -50,7 +50,7 @@
   <text x="1395" y="270" text-anchor="middle" class="box-text">anode margin ≥ 5 mV</text>
   <text x="1395" y="302" text-anchor="middle" class="box-text">SOC ≤ 98%</text>
   <text x="1395" y="334" text-anchor="middle" class="box-text">temperature ≤ 45°C</text>
-  <text x="1395" y="384" text-anchor="middle" class="box-text">24-step bisection search</text>
+  <text x="1395" y="384" text-anchor="middle" class="box-text">sweep + 24-step bisection</text>
   <text x="1395" y="416" text-anchor="middle" class="box-text">for maximum safe current</text>
   <text x="1395" y="462" text-anchor="middle" class="box-title">ALLOW / LIMIT / FAULT</text>
 

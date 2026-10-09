@@ -7,28 +7,40 @@
 
 EV MODIFY is a BMS firmware simulator for conservative, physics-informed charge-current limiting in lithium-ion battery modules.
 
-It features a numerically stable Joseph Form Extended Kalman Filter (EKF), robust calendric aging degradation tracking, and entirely bounds-checked floating-point safety without reliance on NaNs or heavy transcendental math during real-time loops.
+Each control cycle it updates a per-cell SOC estimate (Extended Kalman Filter with Joseph-form covariance update, OCV lookup tables from PyBaMM Chen2020) together with calendar/cycling ageing, then searches for the largest charge current that keeps every series cell inside three limits over a 30 s horizon: anode potential >= 5 mV vs Li (plating margin), SOC <= 98 %, temperature <= 45 °C. All inputs are checked for finiteness and plausibility, and an invalid or out-of-range cell fails closed (FAULT, 0 A). The controller recovers automatically once the measurements are valid again.
+
+Sign convention: positive current = charging.
 
 ## What is included
 
-- `spme_v7_apex_solver.c` — deterministic C charge-limit demonstrator with
-  persistent SOC/temperature states, input validation, a pack-current filter,
-  per-cell prediction, and bisection-based current limiting.
-- `run_pybamm_sim.py` — correctly signed PyBaMM **charge** comparison from
-  10% SOC to 4.2 V. It acts as a reference for voltage/temperature.
-- `calibrate_cell.py` — calibration script to fit model parameters (heat transfer, heat capacity, resistance) to empirical data.
-- `diagrams/` — editable SVG architecture, model-scope, and validation-roadmap
-  figures used by the executive report.
+- `spme_v7_apex_solver.c/.h`: the C11 controller. It holds persistent per-cell state, validates inputs, runs the EKF and ageing update, and evaluates a reduced electrochemical predictor per cell (lumped thermal model, solid-diffusion surface-SOC correction, Butler-Volmer kinetics, electrolyte ohmic and concentration losses). A coarse upward sweep plus 24-step bisection finds the safe current. Electrode and electrolyte parameters follow the Chen2020 (LG M50) set; activation energies and ageing rates are calibration placeholders.
+- `test_solver.c`: demo simulator with a simple plant model, plus `--self-test`. The self-test covers closed-loop limiting, physical trends (current/temperature), full-cell blocking, over-temperature fault and recovery, and invalid inputs (NaN, NULL, bad config).
+- `ocv_proxy.c`: stdin/stdout bridge to the C OCV model, used by the Python tools.
+- `ev_model.py`: shared Python helpers. It parses the OCV tables directly from the C source, so there is a single source of truth.
+- `test_ocv.py`: checks the C OCV tables against the PyBaMM Chen2020 OCP functions, and the built proxy against Python.
+- `run_pybamm_sim.py`: PyBaMM SPMe 1C **charge** from 10 % SOC to 4.2 V (PyBaMM current sign converted to charge-positive). It compares the voltage against the C OCV + I·R surrogate with a least-squares effective resistance.
+- `calibrate_cell.py`: fits the heat-transfer coefficient, specific heat capacity and resistance of the C model to measured data (or a synthetic self-test that must recover known parameters).
+- `diagrams/`: editable SVG architecture, model-scope and validation-roadmap figures.
 
-## Reproducible verification
+## Build and verify
 
-Install the pinned Python dependencies, then run:
-
-```powershell
-python .\run_pybamm_sim.py
+```bash
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure     # C self-test
+./build/ev_modify_solver                       # demo run (CSV to stdout)
 ```
 
-The PyBaMM script confirms the run ends at the charge-voltage limit and writes `pybamm_charge_benchmark.png` beside itself. RMS error between the PyBaMM output and the C-model surrogate is output to the console and displayed on the plot.
+On Windows with MinGW you can run `compile.bat` instead.
+
+```bash
+pip install -r requirements.txt
+python test_ocv.py          # OCV tables vs Chen2020 and C proxy
+python calibrate_cell.py    # synthetic calibration self-test
+python run_pybamm_sim.py    # writes pybamm_charge_benchmark.png beside the script
+```
+
+The PyBaMM benchmark compares terminal voltage only. The I·R surrogate lumps every SPMe overpotential into one fitted resistance (about 51 mΩ for this run, about 35 mV RMS error). It is a sanity check of the OCV/SOC model, not a validation of the plating predictor.
 
 ## Model boundary
 
