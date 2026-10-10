@@ -1523,7 +1523,7 @@ static void test_charger_inside_tolerance_keeps_margin(void) {
     }
     printf("  measured: charger at the tolerance edge, worst anode potential at the delivered current %.2f mV\n", (double)worst_V * 1000.0);
     /* the fast check never trips; a sustained excess above C/100 is caught by the over-charge integral */
-    check(((flags & (uint16_t)~(EV_FAULT_OVER_CURRENT | EV_FAULT_HOLD)) == 0U) && ((first_fault < 0) || (first_fault > 1500)),
+    check(((flags & (EV_FAULT_OVER_CURRENT | EV_FAULT_HOLD)) == flags) && ((first_fault < 0) || (first_fault > 1500)),
           "charger tolerance: a charger just inside the tolerance does not trip the fast over-current check");
     check(worst_V >= EV_MIN_SAFE_ANODE_POTENTIAL_V - 1.0e-4f, "charger tolerance: plating margin kept at the current that flows");
 
