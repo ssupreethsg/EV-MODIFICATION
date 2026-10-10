@@ -71,7 +71,8 @@ if(EV_BUILD_TESTS)
     add_test(NAME ev_modify.c_self_test COMMAND ev_modify_selftest --self-test)
     add_test(NAME ev_modify.c_demo COMMAND ev_modify_selftest)
 
-    # CLI contract: exit 2 = usage / argument error, exit 3 = malformed or out-of-range input line.
+    # CLI contract: exit 2 = usage / argument error, exit 3 = malformed or out-of-range input line,
+    # exit 4 = stdout write error (tested where /dev/full exists).
     set(EV_CLI_CELL "1.0|0.05|0.02|30")
     set(EV_CLI_PACK "${EV_CLI_CELL}|0.5|25")
     function(ev_add_cli_test name expect cli_args)
@@ -98,6 +99,9 @@ if(EV_BUILD_TESTS)
     ev_add_cli_test(charge_dt_too_large 3 "charge|${EV_CLI_PACK}" "-DINPUT=30 1 3.7 25 10 30\\n")
     ev_add_cli_test(limit_soc_out_of_range 3 "limit|${EV_CLI_CELL}|25" "-DINPUT=2 0.01 25 0 1 10 30\\n")
     ev_add_cli_test(nul_byte 3 "ocv" -DINPUT_FILE=${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/nul_line.bin)
+    if(EXISTS "/dev/full")
+        ev_add_cli_test(write_error 4 "ocv" "-DINPUT=0.5\\n" "-DOUTPUT_FILE=/dev/full")
+    endif()
 
     if(EV_PYTHON_TESTS)
         find_package(Python3 COMPONENTS Interpreter)

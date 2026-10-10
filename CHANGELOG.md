@@ -14,7 +14,10 @@ Reworked from the earlier firmware prototype into a validated charge limiter.
 - **Breaking:** the library files are now `src/ev_modify.h` and `src/ev_modify.c` (formerly `spme_v7_apex_solver.*`, a name left over from an earlier project). Include `ev_modify.h`.
 - **Breaking:** `ev_cli ekf` prints a fifth column with the fault flags; `ev_cli` exits 3 for dt outside [0.001, 10] s and 4 when writing stdout fails.
 - **Breaking:** latched faults are cleared with `ev_clear_latched_faults()`; `ev_cell_init()` is for a new cell only (persist `EvCellState` across power cycles).
-- Every limit is computed at the highest current the charger may deliver without a fault (command × 1.05 + 0.05 A), so the over-current tolerance cannot erode the plating margin.
+- Every limit is computed at the highest current the charger may deliver indefinitely without a fault (command × 1.05 + C/100), and the over-charge integral faults on a sustained excess above it.
+- **Breaking:** `EvCellConfig` has a new `max_charge_current_A` field (the cell maker's limit, `EV_CONSTRAINT_CURRENT_LIMIT`); a configuration without it is invalid.
+- The graphite exchange-current activation energy is a worst-case bound (60 kJ/mol below 25 °C, 35 kJ/mol above), so cold charging is slower and the plating margin holds over the published range.
+- The PyBaMM reference also sweeps the exchange-current activation energy (35 / 53.4 / 60 kJ/mol) and runs a charger at and outside its tolerance.
 - The PyBaMM DFN reference uses activation energies independent of the controller (a 2 × 2 sweep at 2 and 10 °C), and adds a lumped-thermal run, a cold constant-voltage taper run and a terminal-voltage check.
 - Documentation: sensor limits of a single voltage channel per cell with the bound the self-test measures for each, the ageing assumption and its limits, and the assumptions behind the quoted C-rates.
 
@@ -32,7 +35,8 @@ Reworked from the earlier firmware prototype into a validated charge limiter.
 ### Fixed
 - The depletion limit is checked at the candidate current; evaluating it at the previous current blocked charging even at 0 A and made the approval alternate with a 1 % current-sensor gain error.
 - A surface stoichiometry beyond the OCP table is a plating violation, and the history depletion is no longer capped at the limit, so neither can under-predict the overpotential.
-- An invalid voltage sample no longer restarts the tracking window or clears a suspicion.
+- An invalid voltage sample no longer restarts the tracking window or clears a suspicion; an intermittent voltage reading is a latched sensor fault, and while a reading is suspect the SOC sigma grows with the charge counted.
+- A pack reading that goes missing during a charge keeps the charge blocked until it is valid at rest, instead of letting it duty-cycle.
 - No credit for Joule self-heating in the electrochemistry and 0 °C checks, so every constraint is monotone in current.
 - Concentration overpotential uses the measured LiPF6 diffusion-potential factor bound (1.85, Landesfeind & Gasteiger 2019) instead of the ideal-solution 0.74.
 - Thermal prediction exact at equilibrium.

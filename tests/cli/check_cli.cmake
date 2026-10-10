@@ -1,6 +1,7 @@
 # Runs ev_cli and checks its exit code (portable replacement for a shell script; run with cmake -P).
 #   -DCLI=<ev_cli>  -DCLI_ARGS=<args separated by |>  -DEXPECT=<exit code>
 #   -DINPUT=<stdin text, "\n" for a newline> or -DINPUT_FILE=<file>  (neither: empty stdin)
+#   -DOUTPUT_FILE=<file>  send stdout there (for example /dev/full to test write errors)
 foreach(required CLI EXPECT)
     if(NOT DEFINED ${required})
         message(FATAL_ERROR "check_cli.cmake: -D${required}= is required")
@@ -12,12 +13,18 @@ if(DEFINED INPUT_FILE)
 else()
     string(REPLACE "\\n" "\n" stdin_text "${INPUT}")
     string(MD5 stdin_key "${CLI_ARGS}${INPUT}${EXPECT}")
-    set(stdin_file "${CMAKE_CURRENT_BINARY_DIR}/cli_stdin_${stdin_key}.txt")
+    set(stdin_file "${CMAKE_CURRENT_BINARY_DIR}/cli_stdin/${stdin_key}.txt")
     file(WRITE "${stdin_file}" "${stdin_text}")
 endif()
-execute_process(COMMAND "${CLI}" ${cli_args}
-                INPUT_FILE "${stdin_file}"
-                RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(DEFINED OUTPUT_FILE)
+    execute_process(COMMAND "${CLI}" ${cli_args}
+                    INPUT_FILE "${stdin_file}" OUTPUT_FILE "${OUTPUT_FILE}"
+                    RESULT_VARIABLE code ERROR_VARIABLE err)
+else()
+    execute_process(COMMAND "${CLI}" ${cli_args}
+                    INPUT_FILE "${stdin_file}"
+                    RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE err)
+endif()
 if(NOT "${code}" STREQUAL "${EXPECT}")
     message(FATAL_ERROR "ev_cli ${cli_args}: exit code ${code}, expected ${EXPECT}\nstdout: ${out}\nstderr: ${err}")
 endif()

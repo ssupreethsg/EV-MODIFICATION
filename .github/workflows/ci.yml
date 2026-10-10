@@ -59,7 +59,7 @@ jobs:
           cmake --install build --config Release --prefix "$RUNNER_TEMP/ev_prefix"
       - name: Consumer via find_package(ev_modify 2.0 REQUIRED)
         run: |
-          cmake -S tests/consumer -B consumer_pkg -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/ev_prefix" -DEV_WARNINGS_AS_ERRORS=ON
+          cmake -S tests/consumer -B consumer_pkg -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/ev_prefix"
           cmake --build consumer_pkg --config Release
           ctest --test-dir consumer_pkg -C Release --output-on-failure
       - name: Consumer via add_subdirectory

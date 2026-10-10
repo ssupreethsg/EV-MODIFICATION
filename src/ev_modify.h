@@ -7,11 +7,14 @@
  *
  *     EvCellConfig config[EV_NUM_CELLS];   // filled once by the integrator
  *     EvCellState  state[EV_NUM_CELLS];
- *     for (i = 0; i < EV_NUM_CELLS; ++i) { ev_cell_init(&state[i], initial_soc[i], initial_temp_C[i]); }
+ *     if (!nvm_restore(state)) {            // integrator's CRC-checked copy, tagged EV_STATE_LAYOUT_VERSION
+ *         for (i = 0; i < EV_NUM_CELLS; ++i) { ev_cell_init(&state[i], initial_soc[i], initial_temp_C[i]); }
+ *     }                                      // new cell only: ev_cell_init() clears latches and ageing
  *     ...
  *     EvPackResult r = ev_step(config, state, pack_current_A, requested_A,
  *                              cell_voltages_V, cell_temperatures_C, dt_s, horizon_s);
  *     command_charger(r.approved_charge_current_A);   // 0 A on EV_DECISION_FAULT
+ *     nvm_save(state);                                // periodically and at shutdown
  *
  * Sign convention: positive current = charging. Units are SI unless the name says otherwise.
  * The library is single-threaded and keeps no global state; all state lives in EvCellState.
@@ -27,6 +30,7 @@ extern "C" {
 #endif
 
 #define EV_NUM_CELLS 4U
+#define EV_STATE_LAYOUT_VERSION 3U   /* changes whenever EvCellState changes: tag persisted copies with it */
 
 /* ---- Physical constants ---------------------------------------------------------------- */
 #define EV_FARADAY_C_PER_MOL 96485.33212f
@@ -56,6 +60,8 @@ extern "C" {
  * reading does not help it pass: the test compares changes, not equality. */
 #define EV_TRACK_SUSPECT_V 0.010f            /* mismatch above this: the EKF ignores the reading until the window validates */
 #define EV_TRACK_FAULT_V 0.020f              /* mismatch above this ... */
+#define EV_INTERMITTENT_SAMPLES 2.5f         /* decaying count of invalid voltage samples (3 within about 20 s) ... */
+#define EV_INTERMITTENT_WINDOW_S 60.0f       /* ... decaying with this time constant => EV_FAULT_VOLTAGE_SENSOR, latched */
 #define EV_TRACK_FAULT_CONFIRM_S 3.0f        /* ... sustained this long (seconds, at least 2 cycles) => plausibility fault, latched until ev_clear_latched_faults() */
 #define EV_TRACK_VALIDATE_V 0.030f           /* window validated (and restarted) once the reading has moved this much beyond the tolerance, as modelled */
 #define EV_TRACK_SPIKE_V 0.050f              /* consecutive readings further apart than this are not used to (re)start a window */
@@ -70,7 +76,7 @@ extern "C" {
 #define EV_OVER_CURRENT_RAMP_S 2.0f          /* after a lower command the charger may ramp down linearly over this time */
 #define EV_OVER_CURRENT_CONFIRM_S 1.0f       /* excess sustained this long (in seconds, not cycles) => fault */
 #define EV_OVER_CHARGE_LIMIT_FRACTION 0.005f /* charge beyond the delivered-current bound (expected x 1.05 + offset), leaky over ... */
-#define EV_CURRENT_OFFSET_A 0.05f            /* current-sensor offset after zero calibration (requirement) */
+#define EV_CURRENT_OFFSET_C_RATE 0.01f       /* current-sensor offset after zero calibration, as a C-rate (requirement) */
 #define EV_OVER_CHARGE_LEAK_S 3600.0f        /* ... this time constant, above this fraction of capacity => over-current fault */
 #define EV_SOC_DIVERGENCE_LIMIT 0.02         /* EKF below the coulomb count since the sensor last worked, beyond 3 sigma => fault */
 #define EV_COUNT_CAPACITY_UNCERTAINTY 0.05   /* capacity error of the coulomb count (SOH model) for its lower SOC bound */
@@ -105,7 +111,11 @@ extern "C" {
 #define EV_ANODE_ACTIVE_FRACTION 0.75f
 /* i0 = k * sqrt(theta * (1 - theta) * c_e / c_e0), k = m_ref * sqrt(c_e0) * c_s_max (Chen2020) */
 #define EV_EXCHANGE_CURRENT_REF_A_M2 0.679f
-#define EV_KINETIC_ACTIVATION_ENERGY_J_MOL 35000.0f      /* Chen2020 */
+/* Graphite exchange-current activation energy: reported values span 35 (Chen2020) to about
+ * 53 kJ/mol (Ecker2015) and more. The bound on i0 uses the high end below 25 degC and the low
+ * end above it, so it is the smallest i0 the range allows on either side. */
+#define EV_KINETIC_ACTIVATION_ENERGY_COLD_J_MOL 60000.0f
+#define EV_KINETIC_ACTIVATION_ENERGY_WARM_J_MOL 35000.0f
 #define EV_DIFFUSION_ACTIVATION_ENERGY_J_MOL 35000.0f    /* placeholder (Chen2020 gives none) */
 
 /* Electrolyte: LiPF6 in EC:EMC, Nyman2008 values at 1 mol/L */
@@ -160,6 +170,8 @@ typedef struct {
     float heat_transfer_W_m2_K;    /* [1, 1000] convective coefficient to the coolant */
     float heat_capacity_J_kg_K;    /* [100, 5000] specific heat */
     float coolant_temperature_C;   /* [-40, 100] ambient/coolant temperature */
+    float max_charge_current_A;    /* (0, 1000] cell maker's maximum charge current (LG M50: 0.7C); set it from the
+                                    * maker's temperature derating when the coolant temperature changes */
 } EvCellConfig;
 
 /* Per-cell persistent state. Initialise with ev_cell_init(); afterwards only ev_step() writes it. */
@@ -198,6 +210,9 @@ typedef struct {
     uint16_t pack_mismatch_cycles; /* consecutive cycles with the cell sum outside the pack-voltage tolerance */
     float pack_mismatch_time_s;    /* time since the first of those cycles */
     bool pack_voltage_fault_latched; /* pack-voltage cross-check failed: latched until ev_clear_latched_faults() */
+    bool pack_unavailable_block;   /* pack reading missing while current flowed: charging blocked until it is valid at rest */
+    float invalid_voltage_score;   /* invalid voltage samples, decaying with EV_INTERMITTENT_WINDOW_S */
+    bool voltage_sensor_latched;   /* intermittent voltage reading: latched until ev_clear_latched_faults() */
     bool track_suspect;            /* mismatch above EV_TRACK_SUSPECT_V: EKF ignores the reading until it validates */
     float commanded_current_A;     /* approved current of the previous ev_step() (0 after a FAULT) */
     float ramp_from_A;             /* level the charger may still be ramping down from */
@@ -216,6 +231,7 @@ typedef struct {
 #define EV_CONSTRAINT_CELL_VOLTAGE 0x10U
 #define EV_CONSTRAINT_ELECTROLYTE_DEPLETION 0x20U
 #define EV_CONSTRAINT_INVALID_INPUT 0x40U
+#define EV_CONSTRAINT_CURRENT_LIMIT 0x80U /* delivered-current bound above max_charge_current_A */
 
 /* Fault bits (EvCellState.fault_flags, EvPackResult.fault_flags) */
 #define EV_FAULT_INPUT 0x01U          /* pack-level input: pointer, current, dt, horizon, request */
@@ -267,8 +283,9 @@ typedef struct {
 
 /* Sets a fresh state for a NEW cell: given SOC (clamped to [0, 1]) with sigma 0.05, zero
  * polarisation, soh = 1 and no faults. Call it at commissioning only: across power cycles,
- * save the whole EvCellState to non-volatile memory and restore it (ev_step() checks every field
- * of a restored state), so SOH, resistance growth and latched faults survive a reboot. Pass a SOC from a rested OCV reading; if it is unknown pass NaN
+ * save the whole EvCellState to non-volatile memory with a CRC and EV_STATE_LAYOUT_VERSION and
+ * restore it, so SOH, resistance growth and latched faults survive a reboot. ev_step() range-checks
+ * the numeric fields of a restored state; it cannot check the bool latches, hence the CRC. Pass a SOC from a rested OCV reading; if it is unknown pass NaN
  * (sigma 0.5: charging stays blocked until the EKF has converged). */
 void ev_cell_init(EvCellState *state, double initial_soc, float initial_temperature_C);
 
@@ -308,7 +325,11 @@ EvPackResult ev_step(const EvCellConfig config[EV_NUM_CELLS], EvCellState state[
  * connectors between the cell taps and the pack sense point, in [0, EV_MAX_PACK_PATH_RESISTANCE_OHM]).
  * A pack reading outside [EV_NUM_CELLS * EV_MIN_PLAUSIBLE_VOLTAGE_V, EV_NUM_CELLS *
  * EV_MAX_PLAUSIBLE_VOLTAGE_V] is "unavailable" (for example a charger output that is not live
- * yet): it never latches, but it is EV_FAULT_INPUT while |current| >= C/50. This is the check that catches a single cell channel that drifts slowly,
+ * yet): it never latches the pack-voltage fault, but once it is missing while |current| >= C/50
+ * the charge is blocked (EV_FAULT_INPUT) until a valid pack reading is seen at rest, so the
+ * check cannot be lost during a charge. The path resistance is trusted: a value set too high
+ * hides a cell reading low in proportion to the current, up to current * the excess.
+ * This is the check that catches a single cell channel that drifts slowly,
  * freezes during the constant-voltage taper or carries an offset smaller than the model-tracking
  * allowance; ev_step() alone cannot separate those from model error (see README, Limits).
  * Set the tolerance from both measurement accuracies and the path-resistance uncertainty times

@@ -43,6 +43,7 @@ static EvCellConfig lgm50_config(void) {
     config.heat_transfer_W_m2_K = 10.0f;
     config.heat_capacity_J_kg_K = 1100.0f;
     config.coolant_temperature_C = 25.0f;
+    config.max_charge_current_A = EV_MAX_PLAUSIBLE_CURRENT_A;   /* no maker cap: the tests stress the electrochemistry */
     return config;
 }
 
@@ -1084,6 +1085,7 @@ static void test_frozen_after_taper_does_not_ratchet(void) {
         (void)run_scenario(&sc, &peak, &final_soc);
         worst = fmax(worst, peak);
     }
+    printf("  measured: reading frozen in the taper, worst peak true SOC %.3f\n", worst);
     check(worst < 0.99, "frozen after taper: no overcharge ratchet");
 }
 
@@ -1101,6 +1103,7 @@ static void test_offset_step_stays_latched(void) {
         Scenario sc = scenario(2, 300.0f, offsets_V[k]);
         sc.request_A = 3.5f;
         uint16_t flags = run_scenario(&sc, &peak, &final_soc);
+        if (offsets_V[k] > -0.04f) { printf("  measured: %.0f mV offset, peak true SOC %.3f, fault flags 0x%x\n", 1000.0 * (double)offsets_V[k], peak, flags); }
         safe = safe && (peak < 0.99);
         if (offsets_V[k] <= -0.05f) {
             detected = detected && ((flags & (EV_FAULT_VOLTAGE_PLAUSIBILITY | EV_FAULT_SOC_DIVERGENCE)) != 0U);
@@ -1120,17 +1123,20 @@ static void test_drifting_reading_is_caught(void) {
     Scenario sc = scenario(4, 600.0f, -20.0e-6f);
     uint16_t flags = run_scenario(&sc, &peak, &final_soc);
     check((flags & (EV_FAULT_SOC_DIVERGENCE | EV_FAULT_VOLTAGE_PLAUSIBILITY)) != 0U, "drift: -20 uV/s drift detected");
+    printf("  measured: -20 uV/s drift, single channel: first fault at true SOC %.3f, peak %.3f\n", g_soc_at_first_fault, peak);
     check((g_soc_at_first_fault > 0.0) && (peak < 1.06), "drift, single channel: divergence backstop bounds the overcharge");
     sc.pack_tolerance_V = 0.03f;
     flags = run_scenario(&sc, &peak, &final_soc);
     check((flags & EV_FAULT_PACK_VOLTAGE) != 0U, "drift: pack-voltage cross-check detects it");
+    printf("  measured: -20 uV/s drift, pack check: first fault at true SOC %.3f\n", g_soc_at_first_fault);
     check((g_soc_at_first_fault > 0.0) && (g_soc_at_first_fault < 0.90) && (peak < 0.99), "drift: pack check stops it before overcharge");
 }
 
-/* Round-6 finding: one invalid sample every 2.5 s restarted the tracking window and cleared the
- * suspicion, so the EKF followed the frozen reading (peak SOC 94 %). The suspicion now survives
- * invalid samples, so the EKF keeps coulomb counting. (The charge pauses that the invalid samples
- * cause make the RC-transient allowance large, so the tracking latch itself need not fire.) */
+/* Round-6/7 findings: one invalid sample every 2.5 s restarted the tracking window and cleared
+ * the suspicion, so the EKF followed the frozen reading; later the charge pauses those samples
+ * cause still hid the freeze from the tracking check and, with a 20 % capacity error, the cell
+ * reached 4.22 V. An intermittent reading is now a latched sensor fault, and while the reading is
+ * suspect the SOC sigma grows with the charge counted. */
 static void test_invalid_samples_do_not_hide_freeze(void) {
     double peak;
     double final_soc;
@@ -1138,10 +1144,19 @@ static void test_invalid_samples_do_not_hide_freeze(void) {
     Scenario sc = scenario(1, 1800.0f, 0.0f);
     sc.dt_s = 0.1f;
     sc.end_s = 3.0f * 3600.0f;
-    sc.invalid_every_s = 2.5f;
-    flags = run_scenario(&sc, &peak, &final_soc);
-    check((flags & EV_FAULT_VOLTAGE_SENSOR) != 0U, "freeze with interleaved invalid samples: invalid samples reported");
-    check(peak < 0.95, "freeze with interleaved invalid samples: suspicion kept, no overcharge");
+    static const float periods_s[] = {2.5f, 10.0f};
+    size_t k;
+    bool latched = true;
+    bool safe = true;
+    for (k = 0U; k < sizeof(periods_s) / sizeof(periods_s[0]); ++k) {
+        sc.invalid_every_s = periods_s[k];
+        sc.capacity_scale = 0.80f;
+        flags = run_scenario(&sc, &peak, &final_soc);
+        latched = latched && ((flags & EV_FAULT_VOLTAGE_SENSOR) != 0U) && (g_soc_at_first_fault < 0.5);
+        safe = safe && (peak < 0.95);
+    }
+    check(latched, "intermittent reading: latched sensor fault");
+    check(safe, "freeze with interleaved invalid samples and 20 % capacity error: no overcharge");
 }
 
 /* A frozen reading is caught once the true voltage moves by the tolerance (a freeze in the taper,
@@ -1190,6 +1205,92 @@ static void test_pack_voltage_cross_check(void) {
     check((flags & EV_FAULT_PACK_VOLTAGE) == 0U, "pack check: 20 mOhm path resistance allowed for");
 }
 
+static void test_intermittent_reading_latches(void) {
+    Pack pack;
+    const double socs[EV_NUM_CELLS] = {0.5, 0.5, 0.5, 0.5};
+    const float temps[EV_NUM_CELLS] = {25.0f, 25.0f, 25.0f, 25.0f};
+    EvPackResult r;
+    float good_V;
+    int i;
+    pack_init(&pack, socs, temps);
+    plant_step(&pack, 0.0f, DT_S);
+    good_V = pack.voltages_V[1];
+    for (i = 0; i < 2; ++i) {   /* two isolated invalid samples: held, then released */
+        pack.voltages_V[1] = 0.0f;
+        (void)ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, 10.0f * DT_S, HORIZON_S);
+        pack.voltages_V[1] = good_V;
+        r = ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, 10.0f * DT_S, HORIZON_S);
+    }
+    for (i = 0; i < 100; ++i) {
+        r = ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, 10.0f * DT_S, HORIZON_S);
+    }
+    check(r.decision != EV_DECISION_FAULT, "intermittent reading: two samples far apart do not latch");
+    for (i = 0; i < 3; ++i) {
+        pack.voltages_V[1] = 0.0f;
+        (void)ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+        pack.voltages_V[1] = good_V;
+        r = ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    }
+    for (i = 0; i < 20; ++i) {
+        r = ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    }
+    check((r.decision == EV_DECISION_FAULT) && ((r.fault_flags & EV_FAULT_VOLTAGE_SENSOR) != 0U) && (r.limiting_cell_index == 1U),
+          "intermittent reading: three invalid samples in 6 s latch a sensor fault");
+    ev_clear_latched_faults(&pack.state[1]);
+    for (i = 0; i < 20; ++i) {
+        r = ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    }
+    check(r.decision != EV_DECISION_FAULT, "intermittent reading: cleared by the service action");
+}
+
+/* While the reading is suspect the SOC is coulomb counted; its sigma must cover a capacity error
+ * on the charge counted (linear growth), not only the time-based random walk. */
+static void test_suspect_sigma_grows_with_charge(void) {
+    Pack pack;
+    const double socs[EV_NUM_CELLS] = {0.5, 0.5, 0.5, 0.5};
+    const float temps[EV_NUM_CELLS] = {25.0f, 25.0f, 25.0f, 25.0f};
+    float frozen_V;
+    double sigma_before;
+    int i;
+    pack_init(&pack, socs, temps);
+    for (i = 0; i < 5; ++i) {
+        plant_step(&pack, 0.0f, DT_S);
+        (void)ev_step(pack.config, pack.state, 0.0f, 0.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    }
+    frozen_V = pack.voltages_V[2];
+    for (i = 0; i < 10; ++i) {   /* a 5 A charge the frozen reading does not follow: suspect, then latched */
+        plant_step(&pack, 5.0f, DT_S);
+        pack.voltages_V[2] = frozen_V;
+        (void)ev_step(pack.config, pack.state, 5.0f, 0.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    }
+    sigma_before = sqrt(pack.state[2].covariance[0]);
+    for (i = 0; i < 100; ++i) {
+        plant_step(&pack, 5.0f, DT_S);
+        pack.voltages_V[2] = frozen_V;
+        (void)ev_step(pack.config, pack.state, 5.0f, 0.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    }
+    check(pack.state[2].track_suspect || pack.state[2].sensor_fault_latched, "suspect sigma: reading is not trusted");
+    check((sqrt(pack.state[2].covariance[0]) - sigma_before) > (0.9 * (double)EV_TRACK_CAPACITY_UNCERTAINTY * (500.0 / 18000.0)),
+          "suspect sigma: grows by the capacity uncertainty times the charge counted");
+}
+
+static void test_charge_current_cap(void) {
+    EvCellConfig config = lgm50_config();
+    EvCellState state;
+    uint8_t constraints = 0U;
+    EvCellPrediction p;
+    float approved_A;
+    config.max_charge_current_A = 3.5f;   /* LG M50: 0.7C */
+    ev_cell_init(&state, 0.1, 25.0f);
+    state.covariance[0] = 1.0e-4;
+    approved_A = ev_cell_max_charge_current(&config, &state, 30.0f, HORIZON_S, &constraints, &p);
+    check((approved_A <= ((3.5f - (EV_CURRENT_OFFSET_C_RATE * 5.0f)) / (1.0f + EV_OVER_CURRENT_TOLERANCE_REL)) + 1.0e-3f)
+          && (approved_A > 3.2f), "current cap: delivered-current bound stays at the maker's maximum");
+    check((constraints & EV_CONSTRAINT_CURRENT_LIMIT) != 0U, "current cap: reported as the binding constraint");
+    config.max_charge_current_A = 0.0f;
+    check(!ev_config_is_valid(&config), "current cap: zero cap is an invalid config");
+}
+
 static void test_pack_voltage_inputs(void) {
     Pack pack;
     const double socs[EV_NUM_CELLS] = {0.5, 0.5, 0.5, 0.5};
@@ -1236,6 +1337,16 @@ static void test_pack_voltage_inputs(void) {
         r = ev_step_with_pack_voltage(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, sum_V, 0.03f, 0.0f);
     }
     check(r.approved_charge_current_A > 0.0f, "clear latched faults: charging resumes on a good reading");
+    r = ev_step_with_pack_voltage(pack.config, pack.state, 2.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, NAN, 0.03f, 0.0f);
+    for (i = 0; i < 10; ++i) {
+        r = ev_step_with_pack_voltage(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, NAN, 0.03f, 0.0f);
+    }
+    check((r.decision == EV_DECISION_FAULT) && ((r.fault_flags & EV_FAULT_INPUT) != 0U),
+          "pack check: missing while charging keeps the charge blocked at rest");
+    for (i = 0; i < 10; ++i) {
+        r = ev_step_with_pack_voltage(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, sum_V, 0.03f, 0.0f);
+    }
+    check(r.approved_charge_current_A > 0.0f, "pack check: a valid reading at rest releases the block");
     for (i = 0; i < (int)EV_NUM_CELLS; ++i) { ev_cell_init(&pack.state[i], 0.5, 25.0f); }
     r = ev_step_with_pack_voltage(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, sum_V, 0.03f, 0.0f);
     check((r.fault_flags & EV_FAULT_PACK_VOLTAGE) == 0U, "pack check: ev_cell_init clears the latch");
@@ -1408,6 +1519,9 @@ static bool self_test(void) {
     test_drifting_reading_is_caught();
     test_pack_voltage_cross_check();
     test_pack_voltage_inputs();
+    test_charge_current_cap();
+    test_intermittent_reading_latches();
+    test_suspect_sigma_grows_with_charge();
     test_invalid_samples_do_not_hide_freeze();
     test_tracking_mismatch_grid();
     test_charger_floor_is_detected();

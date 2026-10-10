@@ -19,6 +19,7 @@ int main(void) {
         config[i].heat_transfer_W_m2_K = 10.0f;
         config[i].heat_capacity_J_kg_K = 1100.0f;
         config[i].coolant_temperature_C = 25.0f;
+        config[i].max_charge_current_A = 20.0f;
         if (!ev_config_is_valid(&config[i])) {
             fprintf(stderr, "configuration rejected\n");
             return 1;
@@ -29,5 +30,5 @@ int main(void) {
     }
     result = ev_step(config, state, 0.0f, 10.0f, voltages_V, temperatures_C, 1.0f, 30.0f);
     printf("decision %u, approved %.3f A\n", (unsigned)result.decision, (double)result.approved_charge_current_A);
-    return (result.decision <= EV_DECISION_FAULT) ? 0 : 1;
+    return ((result.decision == EV_DECISION_ALLOW) && (result.approved_charge_current_A > 9.99f)) ? 0 : 1;
 }
