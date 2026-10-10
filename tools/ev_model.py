@@ -7,6 +7,7 @@ environment variable or in the usual CMake build folders.
 Sample convention shared by all tools (and by ev_step): current_A[i] is the current that
 flowed over the interval (time_s[i-1], time_s[i]].
 """
+
 import functools
 import os
 import re
@@ -28,7 +29,11 @@ def _read(path):
 
 def header_constant(name):
     """Numeric value of a '#define NAME <number>' in the C header."""
-    match = re.search(r"^#define\s+" + name + r"\s+([-+0-9.eE]+)[fFuU]?\b", _read(C_HEADER), re.MULTILINE)
+    match = re.search(
+        r"^#define\s+" + name + r"\s+([-+0-9.eE]+)[fFuU]?\b",
+        _read(C_HEADER),
+        re.MULTILINE,
+    )
     if match is None:
         raise KeyError(f"{name} not found in {C_HEADER}")
     return float(match.group(1))
@@ -113,7 +118,11 @@ def find_ev_cli(explicit=None):
                 raise FileNotFoundError(f"{source} points to {path}, which does not exist")
             return path
     exe = "ev_cli.exe" if sys.platform.startswith("win") else "ev_cli"
-    for folder in ("build", os.path.join("build", "Release"), os.path.join("build", "Debug")):
+    for folder in (
+        "build",
+        os.path.join("build", "Release"),
+        os.path.join("build", "Debug"),
+    ):
         path = os.path.join(ROOT, folder, exe)
         if os.path.isfile(path):
             return path

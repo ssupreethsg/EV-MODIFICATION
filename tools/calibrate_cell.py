@@ -11,6 +11,7 @@ Fitted: heat_transfer_W_m2_K, heat_capacity_J_kg_K, resistance_ohm (R0), rc_resi
 rc_time_constant_s. Exit code 0 = good fit, 1 = poor fit (residuals or parameter at a bound),
 2 = bad input.
 """
+
 import argparse
 import sys
 
@@ -25,9 +26,15 @@ EV_CELL_COOLING_AREA_M2 = m.header_constant("EV_CELL_COOLING_AREA_M2")
 EV_RESISTANCE_ACTIVATION_ENERGY_J_MOL = m.header_constant("EV_RESISTANCE_ACTIVATION_ENERGY_J_MOL")
 GAS_CONSTANT = m.header_constant("EV_GAS_J_PER_MOL_K")
 
-TEMPERATURE_NOISE_C = 0.2   # 1-sigma sensor noise used to weight residuals
+TEMPERATURE_NOISE_C = 0.2  # 1-sigma sensor noise used to weight residuals
 VOLTAGE_NOISE_V = 0.005
-NAMES = ["heat_transfer_W_m2_K", "heat_capacity_J_kg_K", "resistance_ohm", "rc_resistance_ohm", "rc_time_constant_s"]
+NAMES = [
+    "heat_transfer_W_m2_K",
+    "heat_capacity_J_kg_K",
+    "resistance_ohm",
+    "rc_resistance_ohm",
+    "rc_time_constant_s",
+]
 LOWER = np.array([1.0, 100.0, 0.0, 0.0, 1.0])
 UPPER = np.array([200.0, 5000.0, 0.5, 0.5, 5000.0])
 GUESS = np.array([10.0, 900.0, 0.02, 0.02, 100.0])
@@ -36,11 +43,23 @@ REQUIRED_COLUMNS = ("time_s", "current_A", "temperature_C", "voltage_V", "initia
 
 def resistance_scale(temperature_C):
     """R(T) / R(25 degC), as in the C model."""
-    return np.exp(EV_RESISTANCE_ACTIVATION_ENERGY_J_MOL / GAS_CONSTANT
-                  * (1.0 / (np.asarray(temperature_C) + 273.15) - 1.0 / 298.15))
+    return np.exp(
+        EV_RESISTANCE_ACTIVATION_ENERGY_J_MOL
+        / GAS_CONSTANT
+        * (1.0 / (np.asarray(temperature_C) + 273.15) - 1.0 / 298.15)
+    )
 
 
-def simulate_cell(params, time_s, current_A, initial_soc, initial_temp_C, ambient_C, capacity_Ah, resistance_temp_C=None):
+def simulate_cell(
+    params,
+    time_s,
+    current_A,
+    initial_soc,
+    initial_temp_C,
+    ambient_C,
+    capacity_Ah,
+    resistance_temp_C=None,
+):
     """Same discrete equations as the C model (current_A[i] held over (t[i-1], t[i]]): coulomb
     counting, exact lumped-thermal and 1-RC updates, V = OCV(soc) + v_rc + R0(T)*I with R0 and R1
     referred to 25 degC. R0 and R1 use the previous sample's temperature (the C EKF updates the
@@ -82,16 +101,20 @@ def integrate_cell_ode(params, time_s, current_A, initial_soc, initial_temp_C, a
 
         def rhs(_t, x):
             scale = float(resistance_scale(x[2]))
-            return [current / (capacity_Ah * 3600.0),
-                    (r1 * scale * current - x[1]) / tau,
-                    (current * current * (r0 + r1) * scale - conductance_W_K * (x[2] - ambient_C)) / heat_capacity_J_K]
+            return [
+                current / (capacity_Ah * 3600.0),
+                (r1 * scale * current - x[1]) / tau,
+                (current * current * (r0 + r1) * scale - conductance_W_K * (x[2] - ambient_C)) / heat_capacity_J_K,
+            ]
 
         state = solve_ivp(rhs, (time_s[i - 1], time_s[i]), state, rtol=1e-9, atol=1e-12).y[:, -1]
         soc.append(state[0])
         v_rc.append(state[1])
         temp.append(state[2])
     temp = np.array(temp)
-    voltage = m.full_cell_ocv_V(np.array(soc)) + np.array(v_rc) + r0 * resistance_scale(np.r_[temp[0], temp[:-1]]) * current_A
+    voltage = (
+        m.full_cell_ocv_V(np.array(soc)) + np.array(v_rc) + r0 * resistance_scale(np.r_[temp[0], temp[:-1]]) * current_A
+    )
     return temp, voltage
 
 
@@ -100,8 +123,22 @@ def calibrate(data, ambient_C, capacity_Ah):
 
     def residuals(scaled):
         params = LOWER + scaled * (UPPER - LOWER)
-        temp, volt = simulate_cell(params, time_s, current_A, initial_soc, meas_temp[0], ambient_C, capacity_Ah, meas_temp)
-        return np.concatenate(((temp - meas_temp) / TEMPERATURE_NOISE_C, (volt - meas_volt) / VOLTAGE_NOISE_V))
+        temp, volt = simulate_cell(
+            params,
+            time_s,
+            current_A,
+            initial_soc,
+            meas_temp[0],
+            ambient_C,
+            capacity_Ah,
+            meas_temp,
+        )
+        return np.concatenate(
+            (
+                (temp - meas_temp) / TEMPERATURE_NOISE_C,
+                (volt - meas_volt) / VOLTAGE_NOISE_V,
+            )
+        )
 
     result = least_squares(residuals, (GUESS - LOWER) / (UPPER - LOWER), bounds=(0.0, 1.0))
     params = LOWER + result.x * (UPPER - LOWER)
@@ -144,7 +181,7 @@ def load_csv(path):
 def synthetic_data():
     rng = np.random.default_rng(0)
     time_s = np.arange(0.0, 7200.0 + 1.0, 5.0)
-    current_A = np.where(((time_s - 1e-9) % 1200.0) < 600.0, 5.0, 0.0)   # 1C, 10 min on / 10 min off
+    current_A = np.where(((time_s - 1e-9) % 1200.0) < 600.0, 5.0, 0.0)  # 1C, 10 min on / 10 min off
     current_A[time_s > 6000.0] = 0.0
     current_A[0] = 0.0
     truth = np.array([15.0, 1000.0, 0.036, 0.015, 150.0])
@@ -157,9 +194,22 @@ def synthetic_data():
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("csv", nargs="?", help="measured data")
-    parser.add_argument("--self-test", action="store_true", help="fit synthetic data with known parameters")
-    parser.add_argument("--capacity", type=float, default=5.0, help="capacity between the OCV limits [Ah]")
-    parser.add_argument("--ambient", type=float, help="ambient/coolant temperature [degC] (default: first sample)")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="fit synthetic data with known parameters",
+    )
+    parser.add_argument(
+        "--capacity",
+        type=float,
+        default=5.0,
+        help="capacity between the OCV limits [Ah]",
+    )
+    parser.add_argument(
+        "--ambient",
+        type=float,
+        help="ambient/coolant temperature [degC] (default: first sample)",
+    )
     args = parser.parse_args()
     if args.self_test == (args.csv is not None):
         parser.error("give either a CSV file or --self-test")
@@ -175,7 +225,7 @@ def main():
         try:
             data = load_csv(args.csv)
         except ValueError as error:
-            print(f"error: {error}")
+            print(f"error: {error}", file=sys.stderr)
             return 2
     ambient_C = data[2][0] if args.ambient is None else args.ambient
 
@@ -191,7 +241,9 @@ def main():
     if truth is not None:
         rel_err = np.abs(params - truth) / truth
         recovered = bool(np.all(rel_err < 0.05))
-        print(f"CALIBRATION SELF-TEST: {'PASS' if recovered and good_fit else 'FAIL'} (max rel. error {rel_err.max():.2%})")
+        print(
+            f"CALIBRATION SELF-TEST: {'PASS' if recovered and good_fit else 'FAIL'} (max rel. error {rel_err.max():.2%})"
+        )
         return 0 if recovered and good_fit else 1
     return 0 if good_fit else 1
 

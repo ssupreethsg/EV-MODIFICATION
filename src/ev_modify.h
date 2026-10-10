@@ -56,7 +56,7 @@ extern "C" {
  * reading does not help it pass: the test compares changes, not equality. */
 #define EV_TRACK_SUSPECT_V 0.010f            /* mismatch above this: the EKF ignores the reading until the window validates */
 #define EV_TRACK_FAULT_V 0.020f              /* mismatch above this ... */
-#define EV_TRACK_FAULT_CONFIRM_S 3.0f        /* ... sustained this long (seconds, at least 2 cycles) => plausibility fault, latched until ev_cell_init() */
+#define EV_TRACK_FAULT_CONFIRM_S 3.0f        /* ... sustained this long (seconds, at least 2 cycles) => plausibility fault, latched until ev_clear_latched_faults() */
 #define EV_TRACK_VALIDATE_V 0.030f           /* window validated (and restarted) once the reading has moved this much beyond the tolerance, as modelled */
 #define EV_TRACK_SPIKE_V 0.050f              /* consecutive readings further apart than this are not used to (re)start a window */
 #define EV_TRACK_R1_UNCERTAINTY 1.0f         /* relative R1 error allowed for; with any time constant the plant RC voltage lies in [0, (1 + u) R1 dI] */
@@ -69,10 +69,11 @@ extern "C" {
 #define EV_OVER_CURRENT_TOLERANCE_REL 0.05f  /* ... plus this fraction of it */
 #define EV_OVER_CURRENT_RAMP_S 2.0f          /* after a lower command the charger may ramp down linearly over this time */
 #define EV_OVER_CURRENT_CONFIRM_S 1.0f       /* excess sustained this long (in seconds, not cycles) => fault */
-#define EV_OVER_CHARGE_LIMIT_FRACTION 0.02f  /* charge beyond the expected current (no absolute tolerance), leaky over ... */
+#define EV_OVER_CHARGE_LIMIT_FRACTION 0.005f /* charge beyond the delivered-current bound (expected x 1.05 + offset), leaky over ... */
+#define EV_CURRENT_OFFSET_A 0.05f            /* current-sensor offset after zero calibration (requirement) */
 #define EV_OVER_CHARGE_LEAK_S 3600.0f        /* ... this time constant, above this fraction of capacity => over-current fault */
 #define EV_SOC_DIVERGENCE_LIMIT 0.02         /* EKF below the coulomb count since the sensor last worked, beyond 3 sigma => fault */
-#define EV_COUNT_CAPACITY_UNCERTAINTY 0.05   /* capacity error of the coulomb count (SOH tracked) for its lower SOC bound */
+#define EV_COUNT_CAPACITY_UNCERTAINTY 0.05   /* capacity error of the coulomb count (SOH model) for its lower SOC bound */
 #define EV_SOC_DIVERGENCE_ARM_SIGMA 0.03     /* the divergence check is armed once the EKF SOC sigma is below this */
 #define EV_CURRENT_TOLERANCE_A 1.0e-3f
 
@@ -82,9 +83,11 @@ extern "C" {
 #define EV_MAX_PLAUSIBLE_VOLTAGE_V 4.5f
 #define EV_MIN_PLAUSIBLE_TEMPERATURE_C -40.0f
 #define EV_MAX_PLAUSIBLE_TEMPERATURE_C 100.0f
+#define EV_MIN_CONTROL_DT_S 0.001f
 #define EV_MAX_CONTROL_DT_S 10.0f
 #define EV_MAX_PREDICTION_HORIZON_S 600.0f
 #define EV_MAX_PACK_VOLTAGE_TOLERANCE_V 0.5f /* upper limit of the pack-voltage cross-check tolerance */
+#define EV_MAX_PACK_PATH_RESISTANCE_OHM 0.1f /* upper limit of the resistance between cell taps and pack sense */
 
 /* ---- Electrochemical parameters: PyBaMM Chen2020 (LG M50 21700) -------------------------- */
 /* Stoichiometry windows from pybamm.lithium_ion.get_min_max_stoichiometries (2.5-4.2 V,
@@ -189,12 +192,12 @@ typedef struct {
     double reference_soc;          /* coulomb count since the voltage sensor was last shown to track the model */
     double reference_sigma;        /* EKF SOC sigma when that count started */
     double reference_throughput;   /* |charge| / capacity counted since then */
-    bool soc_divergence;           /* EKF and coulomb count disagreed: latched until ev_cell_init() */
-    bool sensor_fault_latched;     /* voltage-tracking plausibility fault: latched until ev_cell_init() */
+    bool soc_divergence;           /* EKF and coulomb count disagreed: latched until ev_clear_latched_faults() */
+    bool sensor_fault_latched;     /* voltage-tracking plausibility fault: latched until ev_clear_latched_faults() */
     float excess_charge_Ah;        /* leaky integral of charge beyond the expected current */
     uint16_t pack_mismatch_cycles; /* consecutive cycles with the cell sum outside the pack-voltage tolerance */
     float pack_mismatch_time_s;    /* time since the first of those cycles */
-    bool pack_voltage_fault_latched; /* pack-voltage cross-check failed: latched until ev_cell_init() */
+    bool pack_voltage_fault_latched; /* pack-voltage cross-check failed: latched until ev_clear_latched_faults() */
     bool track_suspect;            /* mismatch above EV_TRACK_SUSPECT_V: EKF ignores the reading until it validates */
     float commanded_current_A;     /* approved current of the previous ev_step() (0 after a FAULT) */
     float ramp_from_A;             /* level the charger may still be ramping down from */
@@ -262,10 +265,19 @@ typedef struct {
     bool safe;                         /* violated == 0 */
 } EvCellPrediction;
 
-/* Sets a fresh state: given SOC (clamped to [0, 1]) with sigma 0.05, zero polarisation,
- * soh = 1 and no faults. Pass a SOC from a rested OCV reading; if it is unknown pass NaN
+/* Sets a fresh state for a NEW cell: given SOC (clamped to [0, 1]) with sigma 0.05, zero
+ * polarisation, soh = 1 and no faults. Call it at commissioning only: across power cycles,
+ * save the whole EvCellState to non-volatile memory and restore it (ev_step() checks every field
+ * of a restored state), so SOH, resistance growth and latched faults survive a reboot. Pass a SOC from a rested OCV reading; if it is unknown pass NaN
  * (sigma 0.5: charging stays blocked until the EKF has converged). */
 void ev_cell_init(EvCellState *state, double initial_soc, float initial_temperature_C);
+
+/* Service action after the faulty sensor has been repaired: clears the latched faults
+ * (EV_FAULT_VOLTAGE_PLAUSIBILITY tracking latch, EV_FAULT_SOC_DIVERGENCE, EV_FAULT_PACK_VOLTAGE)
+ * and keeps SOH, resistance growth and throughput. The SOC sigma is set to 0.5, so the EKF
+ * re-learns the SOC from the repaired reading (at rest within a cycle) before charge is allowed
+ * on it. Does nothing to an invalid state. */
+void ev_clear_latched_faults(EvCellState *state);
 
 /* True when every EvCellConfig field is finite and inside its documented range. */
 bool ev_config_is_valid(const EvCellConfig *config);
@@ -291,17 +303,24 @@ EvPackResult ev_step(const EvCellConfig config[EV_NUM_CELLS], EvCellState state[
  * series-string voltage taken in the same cycle (a second AFE channel or the charger's output
  * voltage). When |sum of cell readings - measured_pack_voltage_V| exceeds pack_voltage_tolerance_V
  * for EV_TRACK_FAULT_CONFIRM_S (and at least 2 cycles), every cell latches EV_FAULT_PACK_VOLTAGE
- * until ev_cell_init(). This is the check that catches a single cell channel that drifts slowly,
+ * until ev_clear_latched_faults() or ev_cell_init(); plain ev_step() keeps reporting the latch.
+ * The expected pack reading is sum(cells) + current * pack_path_resistance_ohm (busbars and
+ * connectors between the cell taps and the pack sense point, in [0, EV_MAX_PACK_PATH_RESISTANCE_OHM]).
+ * A pack reading outside [EV_NUM_CELLS * EV_MIN_PLAUSIBLE_VOLTAGE_V, EV_NUM_CELLS *
+ * EV_MAX_PLAUSIBLE_VOLTAGE_V] is "unavailable" (for example a charger output that is not live
+ * yet): it never latches, but it is EV_FAULT_INPUT while |current| >= C/50. This is the check that catches a single cell channel that drifts slowly,
  * freezes during the constant-voltage taper or carries an offset smaller than the model-tracking
  * allowance; ev_step() alone cannot separate those from model error (see README, Limits).
- * Set the tolerance from both measurement accuracies, in (0, EV_MAX_PACK_VOLTAGE_TOLERANCE_V].
- * A non-finite pack voltage or an out-of-range tolerance is EV_FAULT_INPUT.
+ * Set the tolerance from both measurement accuracies and the path-resistance uncertainty times
+ * the maximum current, in (0, EV_MAX_PACK_VOLTAGE_TOLERANCE_V]; the README's detection figures
+ * hold for 30 mV or less. An out-of-range tolerance or path resistance is EV_FAULT_INPUT.
  */
 EvPackResult ev_step_with_pack_voltage(const EvCellConfig config[EV_NUM_CELLS], EvCellState state[EV_NUM_CELLS],
                                        float measured_pack_current_A, float requested_charge_current_A,
                                        const float measured_voltages_V[EV_NUM_CELLS], const float measured_temperatures_C[EV_NUM_CELLS],
                                        float control_dt_s, float prediction_horizon_s,
-                                       float measured_pack_voltage_V, float pack_voltage_tolerance_V);
+                                       float measured_pack_voltage_V, float pack_voltage_tolerance_V,
+                                       float pack_path_resistance_ohm);
 
 /* Predicts one cell at a constant charge current. Returns false (and safe = false,
  * violated = EV_CONSTRAINT_INVALID_INPUT) for invalid arguments. */

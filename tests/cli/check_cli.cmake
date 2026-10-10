@@ -1,0 +1,26 @@
+# Runs ev_cli and checks its exit code (portable replacement for a shell script; run with cmake -P).
+#   -DCLI=<ev_cli>  -DCLI_ARGS=<args separated by |>  -DEXPECT=<exit code>
+#   -DINPUT=<stdin text, "\n" for a newline> or -DINPUT_FILE=<file>  (neither: empty stdin)
+foreach(required CLI EXPECT)
+    if(NOT DEFINED ${required})
+        message(FATAL_ERROR "check_cli.cmake: -D${required}= is required")
+    endif()
+endforeach()
+string(REPLACE "|" ";" cli_args "${CLI_ARGS}")
+if(DEFINED INPUT_FILE)
+    set(stdin_file "${INPUT_FILE}")
+else()
+    string(REPLACE "\\n" "\n" stdin_text "${INPUT}")
+    string(MD5 stdin_key "${CLI_ARGS}${INPUT}${EXPECT}")
+    set(stdin_file "${CMAKE_CURRENT_BINARY_DIR}/cli_stdin_${stdin_key}.txt")
+    file(WRITE "${stdin_file}" "${stdin_text}")
+endif()
+execute_process(COMMAND "${CLI}" ${cli_args}
+                INPUT_FILE "${stdin_file}"
+                RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT "${code}" STREQUAL "${EXPECT}")
+    message(FATAL_ERROR "ev_cli ${cli_args}: exit code ${code}, expected ${EXPECT}\nstdout: ${out}\nstderr: ${err}")
+endif()
+if(NOT "${EXPECT}" STREQUAL "0" AND "${err}" STREQUAL "")
+    message(FATAL_ERROR "ev_cli ${cli_args}: failing exit code without a message on stderr")
+endif()

@@ -23,8 +23,10 @@
  *               gradient history, voltage tracking, over-current check). current_A is the current
  *               that flowed over the dt_s that just ended, voltage_V the reading at its end.
  *
- * Exits 2 on a usage error and 3 on malformed, out-of-range or overlong (> EV_CLI_LINE_LENGTH - 2
- * characters) input lines (with a message on stderr).
+ * Exits 2 on a usage error (including out-of-range arguments), 3 on malformed, out-of-range or
+ * overlong (> EV_CLI_LINE_LENGTH - 2 characters) input lines or lines containing a NUL byte, and
+ * 4 when writing to stdout fails (with a message on stderr). dt_s must be in
+ * [EV_MIN_CONTROL_DT_S, EV_MAX_CONTROL_DT_S].
  */
 #include <errno.h>
 #include <math.h>
@@ -35,8 +37,30 @@
 #include "ev_modify.h"
 
 #define EV_CLI_MAX_FIELDS 7
-#define EV_CLI_MAX_DT_S 60.0
 #define EV_CLI_LINE_LENGTH 512
+/* Bounds that keep every double -> float cast defined (C11 6.3.1.5); the library judges plausibility. */
+#define EV_CLI_MAX_PARAMETER 1.0e6
+#define EV_CLI_MAX_VOLTAGE_V 1.0e3
+#define EV_CLI_MAX_TEMPERATURE_C 1.0e3
+
+static int ev_within(double value, double limit) {
+    return (value >= -limit) && (value <= limit);
+}
+
+/* dt in [EV_MIN_CONTROL_DT_S, EV_MAX_CONTROL_DT_S], judged in float exactly as the library does. */
+static int ev_dt_in_range(double dt) {
+    return (dt > 0.0) && (dt <= EV_CLI_MAX_PARAMETER) && ((float)dt >= EV_MIN_CONTROL_DT_S)
+           && ((float)dt <= EV_MAX_CONTROL_DT_S);
+}
+
+/* Flushes stdout; returns 4 (after a message) when any output was lost, else 0. */
+static int ev_flush_status(void) {
+    if ((fflush(stdout) != 0) || ferror(stdout)) {
+        fprintf(stderr, "error writing to stdout\n");
+        return 4;
+    }
+    return 0;
+}
 
 /* Parses exactly `count` finite numbers from `text`; returns 0 on success. */
 static int ev_parse_numbers(const char *text, double *values, int count) {
@@ -57,15 +81,27 @@ static int ev_parse_numbers(const char *text, double *values, int count) {
     return (*cursor == '\0') ? 0 : -1;
 }
 
-/* Reads one line: 1 = line read, 0 = end of input, -1 = line too long for the buffer (reported). */
+/* Reads one line (without the newline): 1 = line read, 0 = end of input, -1 = rejected (reported):
+ * longer than the buffer or containing a NUL byte. */
 static int ev_read_line(char *line, int size, unsigned long line_number) {
-    if (fgets(line, size, stdin) == NULL) {
+    int length = 0;
+    int c = getc(stdin);
+    if (c == EOF) {
         return 0;
     }
-    if ((strchr(line, '\n') == NULL) && (fgetc(stdin) != EOF)) {
-        fprintf(stderr, "line %lu: longer than %d characters\n", line_number, size - 2);
-        return -1;
+    while ((c != EOF) && (c != '\n')) {
+        if (c == '\0') {
+            fprintf(stderr, "line %lu: contains a NUL byte\n", line_number);
+            return -1;
+        }
+        if (length >= (size - 2)) {
+            fprintf(stderr, "line %lu: longer than %d characters\n", line_number, size - 2);
+            return -1;
+        }
+        line[length++] = (char)c;
+        c = getc(stdin);
     }
+    line[length] = '\0';
     return 1;
 }
 
@@ -84,7 +120,9 @@ static int ev_run_ocv(void) {
         }
         ev_full_cell_ocv_V_and_dv_dsoc((float)soc, &ocv, &slope);
         printf("%.6f %.6f\n", (double)ocv, (double)slope);
-        fflush(stdout);
+        if (ev_flush_status() != 0) {
+            return 4;
+        }
     }
     return (status < 0) ? 3 : 0;
 }
@@ -94,8 +132,8 @@ static int ev_parse_config(char *argv[], float coolant_temperature_C, EvCellConf
     double parameters[4];
     unsigned int i;
     for (i = 0U; i < 4U; ++i) {
-        if (ev_parse_numbers(argv[i], &parameters[i], 1) != 0) {
-            fprintf(stderr, "argument %u is not a finite number\n", i + 1U);
+        if ((ev_parse_numbers(argv[i], &parameters[i], 1) != 0) || !ev_within(parameters[i], EV_CLI_MAX_PARAMETER)) {
+            fprintf(stderr, "argument %u is not a finite number of plausible size\n", i + 1U);
             return 2;
         }
     }
@@ -120,8 +158,8 @@ static int ev_run_limit(char *argv[]) {
     unsigned long line_number = 0UL;
     int status;
 
-    if (ev_parse_numbers(argv[4], &coolant_C, 1) != 0) {
-        fprintf(stderr, "argument 5 is not a finite number\n");
+    if ((ev_parse_numbers(argv[4], &coolant_C, 1) != 0) || !ev_within(coolant_C, EV_CLI_MAX_TEMPERATURE_C)) {
+        fprintf(stderr, "argument 5 is not a finite temperature\n");
         return 2;
     }
     status = ev_parse_config(argv, (float)coolant_C, &config);
@@ -150,7 +188,9 @@ static int ev_run_limit(char *argv[]) {
         approved_A = ev_cell_max_charge_current(&config, &state, (float)f[5], (float)f[6], &constraints, &prediction);
         printf("%.6f %.6f %.6f %.4f %u\n", (double)approved_A, (double)prediction.anode_potential_V,
                (double)prediction.terminal_voltage_V, (double)prediction.predicted_temperature_C, (unsigned)constraints);
-        fflush(stdout);
+        if (ev_flush_status() != 0) {
+            return 4;
+        }
     }
     return (status < 0) ? 3 : 0;
 }
@@ -193,8 +233,9 @@ static int ev_run_pack(char *argv[], int closed_loop) {
         float horizon_s = 30.0f;
         EvPackResult result;
         ++line_number;
-        if ((ev_parse_numbers(line, f, field_count) != 0) || (f[0] <= 0.0) || (f[0] > EV_CLI_MAX_DT_S)
-            || (fabs(f[1]) > (double)EV_MAX_PLAUSIBLE_CURRENT_A)
+        if ((ev_parse_numbers(line, f, field_count) != 0) || !ev_dt_in_range(f[0])
+            || (fabs(f[1]) > (double)EV_MAX_PLAUSIBLE_CURRENT_A) || !ev_within(f[2], EV_CLI_MAX_VOLTAGE_V)
+            || !ev_within(f[3], EV_CLI_MAX_TEMPERATURE_C)
             || (closed_loop && ((f[4] < 0.0) || (f[4] > (double)EV_MAX_PLAUSIBLE_CURRENT_A)
                                 || (f[5] <= 0.0) || (f[5] > (double)EV_MAX_PREDICTION_HORIZON_S)))) {
             fprintf(stderr, closed_loop
@@ -223,7 +264,9 @@ static int ev_run_pack(char *argv[], int closed_loop) {
             printf("%.6f %.6f %.6f %u %u\n", state[0].soc, sqrt(state[0].covariance[0]), (double)state[0].rc_voltage_V,
                    (unsigned)result.decision, (unsigned)result.fault_flags);
         }
-        fflush(stdout);
+        if (ev_flush_status() != 0) {
+            return 4;
+        }
     }
     return (status < 0) ? 3 : 0;
 }

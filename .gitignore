@@ -26,3 +26,8 @@ CMakeUserPresets.json
 # CMake / CTest output in-tree
 cmake-build-*/
 Testing/
+
+.ruff_cache/
+*.gcov
+*.gcda
+*.gcno
