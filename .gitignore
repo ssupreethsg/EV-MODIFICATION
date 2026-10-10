@@ -1,0 +1,28 @@
+# Build output
+build/
+out/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.pdb
+*.ilk
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDEs
+.vs/
+.vscode/
+.idea/
+CMakeUserPresets.json
+
+# CMake / CTest output in-tree
+cmake-build-*/
+Testing/

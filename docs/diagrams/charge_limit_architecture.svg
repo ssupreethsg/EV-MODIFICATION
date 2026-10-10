@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="760" viewBox="0 0 1600 760" role="img" aria-labelledby="title description">
   <title id="title">EV MODIFY adaptive charge-limit architecture</title>
-  <desc id="description">A left-to-right flow from pack sensors to current filtering, per-cell state estimation, a thirty second physics prediction, safety constraints, adaptive current search and the charger command.</desc>
+  <desc id="description">A left-to-right flow from pack measurements through input validation, per-cell EKF state estimation and a physics prediction for every series cell to the constraint-based current search and an ALLOW, LIMIT or FAULT decision.</desc>
   <defs>
     <marker id="arrow" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto"><path d="M0,0 L11,5.5 L0,11 Z" fill="#213547"/></marker>
     <style>
@@ -14,45 +14,45 @@
   </defs>
   <rect width="1600" height="760" fill="#f7fbff"/>
   <text x="80" y="70" class="title">EV MODIFY — adaptive charge-limit architecture</text>
-  <text x="80" y="108" class="subtitle">Positive current = charging • all calculations are bounded • invalid state fails closed</text>
+  <text x="80" y="108" class="subtitle">Positive current = charging • every input range-checked • faults fail closed with hysteresis and hold</text>
 
   <rect x="70" y="230" width="210" height="180" rx="18" fill="#d9eefc" stroke="#1f77b4" stroke-width="3"/>
   <text x="175" y="274" text-anchor="middle" class="box-title">Measurements</text>
   <text x="175" y="315" text-anchor="middle" class="box-text">Pack current</text>
-  <text x="175" y="345" text-anchor="middle" class="box-text">Cell temperature</text>
-  <text x="175" y="375" text-anchor="middle" class="box-text">SOC / SOH inputs</text>
+  <text x="175" y="345" text-anchor="middle" class="box-text">Cell voltages + temps</text>
+  <text x="175" y="375" text-anchor="middle" class="box-text">Charge request</text>
 
   <rect x="350" y="230" width="210" height="180" rx="18" fill="#e7f6e7" stroke="#2e8b57" stroke-width="3"/>
   <text x="455" y="274" text-anchor="middle" class="box-title">Input gate</text>
-  <text x="455" y="315" text-anchor="middle" class="box-text">Finite-range checks</text>
-  <text x="455" y="345" text-anchor="middle" class="box-text">Plausibility windows</text>
-  <text x="455" y="375" text-anchor="middle" class="box-text">Sensor fault → FAULT</text>
+  <text x="455" y="315" text-anchor="middle" class="box-text">Finite + range checks</text>
+  <text x="455" y="345" text-anchor="middle" class="box-text">Config validation</text>
+  <text x="455" y="375" text-anchor="middle" class="box-text">Fault hold + hysteresis</text>
 
   <rect x="630" y="190" width="250" height="260" rx="18" fill="#fff2cc" stroke="#d99b00" stroke-width="3"/>
   <text x="755" y="234" text-anchor="middle" class="box-title">Persisted cell state</text>
-  <text x="755" y="278" text-anchor="middle" class="box-text">SOC (EKF + coulomb count)</text>
-  <text x="755" y="310" text-anchor="middle" class="box-text">Lumped temperature</text>
-  <text x="755" y="342" text-anchor="middle" class="box-text">Capacity, resistance, SOH</text>
-  <text x="755" y="392" text-anchor="middle" class="small">Estimates absorb new measurements</text>
-  <text x="755" y="416" text-anchor="middle" class="small">before the current search runs.</text>
+  <text x="755" y="278" text-anchor="middle" class="box-text">SOC + RC voltage (EKF)</text>
+  <text x="755" y="310" text-anchor="middle" class="box-text">Temperature, SOH, ΔR0</text>
+  <text x="755" y="342" text-anchor="middle" class="box-text">3σ SOC uncertainty</text>
+  <text x="755" y="392" text-anchor="middle" class="small">Updated from new measurements</text>
+  <text x="755" y="416" text-anchor="middle" class="small">before each current search.</text>
 
   <rect x="950" y="190" width="260" height="260" rx="18" fill="#f4e6ff" stroke="#7f3c8d" stroke-width="3"/>
-  <text x="1080" y="234" text-anchor="middle" class="box-title">30-second predictor</text>
-  <text x="1080" y="278" text-anchor="middle" class="box-text">Temperature + Joule heat</text>
-  <text x="1080" y="310" text-anchor="middle" class="box-text">Surface-SOC surrogate</text>
-  <text x="1080" y="342" text-anchor="middle" class="box-text">Kinetic + electrolyte losses</text>
+  <text x="1080" y="234" text-anchor="middle" class="box-title">Horizon predictor</text>
+  <text x="1080" y="278" text-anchor="middle" class="box-text">Thermal + 1-RC voltage</text>
+  <text x="1080" y="310" text-anchor="middle" class="box-text">Surface SOC + kinetics</text>
+  <text x="1080" y="342" text-anchor="middle" class="box-text">Electrolyte ohmic + depletion</text>
   <text x="1080" y="392" text-anchor="middle" class="small">Evaluated separately for</text>
   <text x="1080" y="416" text-anchor="middle" class="small">every series cell.</text>
 
   <rect x="1280" y="145" width="230" height="350" rx="18" fill="#fde8e8" stroke="#c53030" stroke-width="3"/>
   <text x="1395" y="190" text-anchor="middle" class="box-title">Decision engine</text>
   <text x="1395" y="237" text-anchor="middle" class="box-text">Constraints:</text>
-  <text x="1395" y="270" text-anchor="middle" class="box-text">anode margin ≥ 5 mV</text>
-  <text x="1395" y="302" text-anchor="middle" class="box-text">SOC ≤ 98%</text>
-  <text x="1395" y="334" text-anchor="middle" class="box-text">temperature ≤ 45°C</text>
+  <text x="1395" y="270" text-anchor="middle" class="box-text">anode ≥ 5 mV, V ≤ 4.2 V</text>
+  <text x="1395" y="302" text-anchor="middle" class="box-text">SOC + 3σ ≤ 98 %</text>
+  <text x="1395" y="334" text-anchor="middle" class="box-text">0 °C ≤ T ≤ 45 °C</text>
   <text x="1395" y="384" text-anchor="middle" class="box-text">sweep + 24-step bisection</text>
   <text x="1395" y="416" text-anchor="middle" class="box-text">for maximum safe current</text>
-  <text x="1395" y="462" text-anchor="middle" class="box-title">ALLOW / LIMIT / FAULT</text>
+  <text x="1395" y="462" text-anchor="middle" class="box-title" style="font-size:20px">ALLOW / LIMIT / FAULT</text>
 
   <path d="M280 320 H350" class="arrow"/>
   <path d="M560 320 H630" class="arrow"/>

@@ -1,0 +1,3 @@
+# Needed by the CTest Python checks (tests/test_ocv.py, tools/calibrate_cell.py, tools/generate_ocv_lut.py)
+numpy>=1.26,<3
+scipy>=1.11,<2
