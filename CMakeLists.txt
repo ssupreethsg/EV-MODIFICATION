@@ -7,6 +7,10 @@ option(EV_BUILD_TESTS "Build the self-test, the CLI bridge and register the test
 option(EV_WARNINGS_AS_ERRORS "Treat compiler warnings as errors (CI turns this on)" OFF)
 option(EV_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer (GCC/Clang)" OFF)
 option(EV_INSTALL "Generate the install and package rules" ${PROJECT_IS_TOP_LEVEL})
+if(EV_INSTALL AND EV_SANITIZE)
+    message(WARNING "EV_SANITIZE builds are for testing only: install rules disabled")
+    set(EV_INSTALL OFF)
+endif()
 option(EV_PYTHON_TESTS "Register the Python checks with CTest (need numpy and scipy)" ON)
 
 if(PROJECT_IS_TOP_LEVEL)
@@ -36,7 +40,7 @@ if(EV_SANITIZE AND NOT MSVC)
 endif()
 
 # ---- Controller library -------------------------------------------------------------------
-add_library(ev_modify STATIC src/spme_v7_apex_solver.c)
+add_library(ev_modify STATIC src/ev_modify.c)
 add_library(ev_modify::ev_modify ALIAS ev_modify)
 target_compile_features(ev_modify PUBLIC c_std_11)
 target_include_directories(ev_modify PUBLIC
@@ -94,7 +98,7 @@ if(EV_INSTALL)
     install(TARGETS ev_modify EXPORT ev_modifyTargets
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
             INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-    install(FILES src/spme_v7_apex_solver.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(FILES src/ev_modify.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
     install(EXPORT ev_modifyTargets NAMESPACE ev_modify:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ev_modify)
     file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/ev_modifyConfig.cmake.in
          "@PACKAGE_INIT@\ninclude(\"\${CMAKE_CURRENT_LIST_DIR}/ev_modifyTargets.cmake\")\ncheck_required_components(ev_modify)\n")

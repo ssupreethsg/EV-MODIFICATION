@@ -49,8 +49,8 @@
 
   <rect x="1190" y="455" width="330" height="220" rx="20" fill="#fde8e8" stroke="#c53030" stroke-width="3"/>
   <text x="1355" y="503" text-anchor="middle" class="heading">Not yet demonstrated</text>
-  <text x="1235" y="555" class="text">• Plating validation</text>
-  <text x="1235" y="595" class="text">• Cell-specific calibration</text>
+  <text x="1235" y="555" class="text">• Plating tests on real cells</text>
+  <text x="1235" y="595" class="text">• Calibration on the target cell</text>
   <text x="1235" y="635" class="text">• Vehicle safety certification</text>
 
   <path d="M390 410 H505" class="arrow"/>

@@ -1,4 +1,4 @@
-"""Regenerates the OCV lookup tables in src/spme_v7_apex_solver.c from the Chen2020 OCP
+"""Regenerates the OCV lookup tables in src/ev_modify.c from the Chen2020 OCP
 functions and the stoichiometry windows in the header.
 
     python tools/generate_ocv_lut.py           # rewrite the tables in place

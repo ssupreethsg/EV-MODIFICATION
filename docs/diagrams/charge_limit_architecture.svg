@@ -25,14 +25,14 @@
   <rect x="350" y="230" width="210" height="180" rx="18" fill="#e7f6e7" stroke="#2e8b57" stroke-width="3"/>
   <text x="455" y="274" text-anchor="middle" class="box-title">Input gate</text>
   <text x="455" y="315" text-anchor="middle" class="box-text">Finite + range checks</text>
-  <text x="455" y="345" text-anchor="middle" class="box-text">Config validation</text>
+  <text x="455" y="345" text-anchor="middle" class="box-text">Sensor + current checks</text>
   <text x="455" y="375" text-anchor="middle" class="box-text">Fault hold + hysteresis</text>
 
   <rect x="630" y="190" width="250" height="260" rx="18" fill="#fff2cc" stroke="#d99b00" stroke-width="3"/>
   <text x="755" y="234" text-anchor="middle" class="box-title">Persisted cell state</text>
   <text x="755" y="278" text-anchor="middle" class="box-text">SOC + RC voltage (EKF)</text>
   <text x="755" y="310" text-anchor="middle" class="box-text">Temperature, SOH, ΔR0</text>
-  <text x="755" y="342" text-anchor="middle" class="box-text">3σ SOC uncertainty</text>
+  <text x="755" y="342" text-anchor="middle" class="box-text">3σ SOC, gradient memory</text>
   <text x="755" y="392" text-anchor="middle" class="small">Updated from new measurements</text>
   <text x="755" y="416" text-anchor="middle" class="small">before each current search.</text>
 

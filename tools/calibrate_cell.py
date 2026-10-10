@@ -40,11 +40,12 @@ def resistance_scale(temperature_C):
                   * (1.0 / (np.asarray(temperature_C) + 273.15) - 1.0 / 298.15))
 
 
-def simulate_cell(params, time_s, current_A, initial_soc, initial_temp_C, ambient_C, capacity_Ah):
+def simulate_cell(params, time_s, current_A, initial_soc, initial_temp_C, ambient_C, capacity_Ah, resistance_temp_C=None):
     """Same discrete equations as the C model (current_A[i] held over (t[i-1], t[i]]): coulomb
     counting, exact lumped-thermal and 1-RC updates, V = OCV(soc) + v_rc + R0(T)*I with R0 and R1
-    referred to 25 degC. R0 uses the previous sample's temperature (the C EKF updates the state
-    temperature after the estimator)."""
+    referred to 25 degC. R0 and R1 use the previous sample's temperature (the C EKF updates the
+    state temperature after the estimator): the measured one when resistance_temp_C is given, as
+    in the controller, otherwise the simulated one."""
     h, cp, r0, r1, tau = params
     conductance_W_K = h * EV_CELL_COOLING_AREA_M2
     heat_capacity_J_K = EV_CELL_MASS_KG * cp
@@ -56,14 +57,15 @@ def simulate_cell(params, time_s, current_A, initial_soc, initial_temp_C, ambien
     for i in range(1, n):
         dt = time_s[i] - time_s[i - 1]
         current = current_A[i]
-        scale = resistance_scale(temp[i - 1])
+        scale = resistance_scale(temp[i - 1] if resistance_temp_C is None else resistance_temp_C[i - 1])
         soc[i] = np.clip(soc[i - 1] + current * dt / (capacity_Ah * 3600.0), 0.0, 1.0)
         a = np.exp(-dt / tau)
         v_rc[i] = a * v_rc[i - 1] + r1 * scale * (1.0 - a) * current
         rise = current * current * (r0 + r1) * scale / conductance_W_K
         decay = np.exp(-conductance_W_K * dt / heat_capacity_J_K)
         temp[i] = ambient_C + rise + (temp[i - 1] - ambient_C - rise) * decay
-    voltage = m.full_cell_ocv_V(soc) + v_rc + r0 * resistance_scale(np.r_[temp[0], temp[:-1]]) * current_A
+    r_temp = temp if resistance_temp_C is None else np.asarray(resistance_temp_C)
+    voltage = m.full_cell_ocv_V(soc) + v_rc + r0 * resistance_scale(np.r_[r_temp[0], r_temp[:-1]]) * current_A
     return temp, voltage
 
 
@@ -98,7 +100,7 @@ def calibrate(data, ambient_C, capacity_Ah):
 
     def residuals(scaled):
         params = LOWER + scaled * (UPPER - LOWER)
-        temp, volt = simulate_cell(params, time_s, current_A, initial_soc, meas_temp[0], ambient_C, capacity_Ah)
+        temp, volt = simulate_cell(params, time_s, current_A, initial_soc, meas_temp[0], ambient_C, capacity_Ah, meas_temp)
         return np.concatenate(((temp - meas_temp) / TEMPERATURE_NOISE_C, (volt - meas_volt) / VOLTAGE_NOISE_V))
 
     result = least_squares(residuals, (GUESS - LOWER) / (UPPER - LOWER), bounds=(0.0, 1.0))

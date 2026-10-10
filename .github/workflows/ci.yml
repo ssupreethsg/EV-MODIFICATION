@@ -79,7 +79,7 @@ jobs:
         run: |
           arm-none-eabi-gcc -std=c11 -O2 -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wdouble-promotion -Werror \
-            -Isrc -c src/spme_v7_apex_solver.c -o ev_modify_cm4.o
+            -Isrc -c src/ev_modify.c -o ev_modify_cm4.o
           arm-none-eabi-size ev_modify_cm4.o
 
   static-analysis:
@@ -100,10 +100,10 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="--coverage -O0" -DEV_PYTHON_TESTS=OFF
       - run: cmake --build build
       - run: ctest --test-dir build --output-on-failure
-      - name: Check line coverage of src/spme_v7_apex_solver.c
+      - name: Check line coverage of src/ev_modify.c
         run: |
           cd build
-          report=$(gcov -o CMakeFiles/ev_modify.dir/src/spme_v7_apex_solver.c.gcda "$GITHUB_WORKSPACE/src/spme_v7_apex_solver.c")
+          report=$(gcov -o CMakeFiles/ev_modify.dir/src/ev_modify.c.gcda "$GITHUB_WORKSPACE/src/ev_modify.c")
           echo "$report"
           percent=$(echo "$report" | grep -m1 -oP 'Lines executed:\K[0-9.]+')
           python3 -c "import sys; sys.exit(0 if float('$percent') >= 95.0 else 1)"

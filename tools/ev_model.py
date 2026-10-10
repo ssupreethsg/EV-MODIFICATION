@@ -1,6 +1,6 @@
 """Helpers shared by the Python tools so they use exactly the C model's data.
 
-Constants and OCV lookup tables are parsed from src/spme_v7_apex_solver.{h,c}
+Constants and OCV lookup tables are parsed from src/ev_modify.{h,c}
 (single source of truth). The ev_cli executable is located through the EV_CLI
 environment variable or in the usual CMake build folders.
 
@@ -16,8 +16,8 @@ import sys
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-C_HEADER = os.path.join(ROOT, "src", "spme_v7_apex_solver.h")
-C_SOURCE = os.path.join(ROOT, "src", "spme_v7_apex_solver.c")
+C_HEADER = os.path.join(ROOT, "src", "ev_modify.h")
+C_SOURCE = os.path.join(ROOT, "src", "ev_modify.c")
 LUT_POINTS = 201
 
 

@@ -8,12 +8,13 @@
  * deliberately mismatched parameters); the validation against an independent model is
  * tools/run_pybamm_sim.py.
  */
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "spme_v7_apex_solver.h"
+#include "ev_modify.h"
 
 #define DT_S 1.0f
 #define HORIZON_S 30.0f
@@ -238,7 +239,8 @@ static void test_full_cell_blocks_charge(void) {
     Pack pack;
     EvPackResult result;
     pack_uniform(&pack, 0.5, 25.0f);
-    pack.state[2].soc = 0.99;
+    ev_cell_init(&pack.state[2], 0.99, 25.0f);
+    pack.state[2].covariance[0] = 1.0e-4;
     pack.true_soc[2] = 0.99;
     result = pack_step(&pack, 0.0f, 5.0f);
     check(result.decision == EV_DECISION_LIMIT, "full cell: LIMIT");
@@ -538,14 +540,14 @@ static void test_frozen_sensor_detected_when_charge_starts(void) {
     }
     result = ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
     frozen_V = pack.voltages_V[1];
-    for (cycle = 0U; cycle < EV_TRACK_FAULT_CYCLES + 1U; ++cycle) {
+    for (cycle = 0U; cycle < (uint32_t)(EV_TRACK_FAULT_CONFIRM_S / DT_S) + 2U; ++cycle) {
         float applied_A = result.approved_charge_current_A;
         plant_step(&pack, applied_A, DT_S);
         pack.voltages_V[1] = frozen_V;   /* no R0 step when the current starts */
         result = ev_step(pack.config, pack.state, applied_A, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
         detected = detected || ((result.fault_flags & EV_FAULT_VOLTAGE_PLAUSIBILITY) != 0U);
     }
-    check(detected, "frozen sensor: missing R0 step at charge start flagged within 4 cycles");
+    check(detected, "frozen sensor: missing R0 step at charge start flagged within the confirmation time");
 }
 
 /* Round-4 finding: +/-1.5 mV of noise on a frozen reading restarted the old dead-band run every
@@ -883,13 +885,407 @@ static void test_gradients_remember_previous_current(void) {
     EvCellPrediction p_after;
     ev_cell_init(&fresh, 0.5, 5.0f);
     ev_cell_init(&after_step_down, 0.5, 5.0f);
-    after_step_down.last_current_A = 6.0f;
+    after_step_down.solid_history_current_A = 6.0f;
+    after_step_down.electrolyte_history_current_A = 6.0f;
     (void)ev_predict_cell(&config, &fresh, 1.5f, HORIZON_S, &p_fresh);
     (void)ev_predict_cell(&config, &after_step_down, 1.5f, HORIZON_S, &p_after);
     check(p_after.anode_potential_V < p_fresh.anode_potential_V - 0.005f, "physics: gradients after a 6 A -> 1.5 A step use the 6 A history");
-    after_step_down.last_current_A = -6.0f;   /* discharge history adds nothing */
-    (void)ev_predict_cell(&config, &after_step_down, 1.5f, HORIZON_S, &p_after);
-    check(p_after.anode_potential_V == p_fresh.anode_potential_V, "physics: discharge history does not change the charge prediction");
+    /* Round-5 finding: the depletion limit evaluated at the history current failed even at 0 A. */
+    after_step_down.electrolyte_history_current_A = 100.0f;
+    (void)ev_predict_cell(&config, &after_step_down, 0.0f, HORIZON_S, &p_after);
+    check((p_after.violated & EV_CONSTRAINT_ELECTROLYTE_DEPLETION) == 0U, "physics: the depletion limit is checked at the candidate current");
+}
+
+/* Round-5 finding: the history lasted one control cycle, far shorter than the gradients. */
+static void test_gradient_history_decays_slowly(void) {
+    Pack pack;
+    EvPackResult result;
+    float charge_A = 0.0f;
+    float history_A;
+    int t;
+    pack_uniform(&pack, 0.3, 25.0f);
+    for (t = 0; t < 120; ++t) {
+        result = pack_step(&pack, charge_A, 20.0f);
+        charge_A = result.approved_charge_current_A;
+    }
+    history_A = pack.state[0].solid_history_current_A;
+    check(history_A > 2.0f, "history: tracks the charge current");
+    for (t = 0; t < 10; ++t) { (void)pack_step(&pack, 0.0f, 0.0f); }
+    check(pack.state[0].solid_history_current_A > 0.75f * history_A, "history: solid gradient remembered 10 s after the stop");
+    check(pack.state[0].electrolyte_history_current_A > 0.6f * history_A, "history: electrolyte gradient remembered 10 s after the stop");
+    for (t = 0; t < 900; ++t) { (void)pack_step(&pack, 0.0f, 0.0f); }
+    check(pack.state[0].solid_history_current_A < 0.01f * history_A, "history: decays away at rest");
+}
+
+/* Round-5 finding: a current sensor reading 1-4 % high (inside the over-current tolerance)
+ * made the approval alternate between the limit and 0 A. */
+static void test_limit_stable_with_current_gain_error(void) {
+    static const double socs[2] = {0.1, 0.5};
+    static const float gains[3] = {1.01f, 1.02f, 1.04f};
+    bool stable = true;
+    bool no_fault = true;
+    int s;
+    int g;
+    int t;
+    for (s = 0; s < 2; ++s) {
+        for (g = 0; g < 3; ++g) {
+            Pack pack;
+            EvPackResult result;
+            float command_A = 0.0f;
+            float low_A = FLT_MAX;
+            float high_A = 0.0f;
+            pack_uniform(&pack, socs[s], 25.0f);
+            for (t = 0; t < 90; ++t) {
+                plant_step(&pack, command_A, DT_S);
+                result = ev_step(pack.config, pack.state, command_A * gains[g], 20.0f,
+                                 pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+                no_fault = no_fault && (result.decision != EV_DECISION_FAULT);
+                command_A = result.approved_charge_current_A;
+                if (t >= 30) {
+                    low_A = fminf(low_A, command_A);
+                    high_A = fmaxf(high_A, command_A);
+                }
+            }
+            stable = stable && (low_A > 0.9f * high_A) && (high_A > 1.0f);
+        }
+    }
+    check(no_fault, "history: no fault with a 1-4 % current gain error");
+    check(stable, "history: approval does not oscillate with a current gain error");
+}
+
+/* Round-5 finding: SOC estimate corrected 0.2 -> 0.5 just after a step-down; the second cycle
+ * evaluated the gradients at the lower current only. */
+static void test_soc_jump_after_step_down_keeps_gradients(void) {
+    Pack pack;
+    EvPackResult result;
+    EvCellState no_history;
+    EvCellPrediction p;
+    float charge_A = 0.0f;
+    float with_history_A;
+    int t;
+    pack_uniform(&pack, 0.2, 25.0f);
+    for (t = 0; t < 120; ++t) {
+        result = pack_step(&pack, charge_A, 20.0f);
+        charge_A = result.approved_charge_current_A;
+    }
+    for (t = 0; t < (int)EV_NUM_CELLS; ++t) { pack.state[t].soc = 0.5; }
+    result = pack_step(&pack, charge_A, 20.0f);
+    result = pack_step(&pack, result.approved_charge_current_A, 20.0f);
+    with_history_A = result.approved_charge_current_A;
+    no_history = pack.state[0];
+    no_history.solid_history_current_A = 0.0f;
+    no_history.electrolyte_history_current_A = 0.0f;
+    (void)ev_predict_cell(&pack.config[0], &pack.state[0], with_history_A, HORIZON_S, &p);
+    check(p.anode_potential_V >= EV_MIN_SAFE_ANODE_POTENTIAL_V, "history: approval after an SOC jump respects the remembered gradients");
+    (void)ev_predict_cell(&pack.config[0], &no_history, with_history_A, HORIZON_S, &p);
+    check(p.anode_potential_V > EV_MIN_SAFE_ANODE_POTENTIAL_V + 0.001f, "history: the remembered gradients lower the approval after an SOC jump");
+}
+
+/* Sensor-fault scenario for the round-5 C-safety findings: cells at 30/30/40/30 % SOC, cell 2
+ * (the fullest) has the faulty reading. mode 0 none, 1 frozen from fault_s, 2 offset step of
+ * value_V at fault_s, 3 glitch of value_V for length_s from fault_s, 4 drift of value_V per second. floor_A: the charger never
+ * goes below this current. Returns the true peak SOC of cell 2 and the union of fault flags. */
+typedef struct {
+    int mode;
+    float fault_s;
+    float value_V;
+    float length_s;
+    float dt_s;
+    float request_A;
+    float floor_A;
+    float end_s;
+    float r0_scale;
+    float r1_scale;
+    float tau_scale;
+    float capacity_scale;
+    float pack_tolerance_V;   /* > 0: ev_step_with_pack_voltage() with an independent 10 mV-LSB pack reading */
+} Scenario;
+
+static Scenario scenario(int mode, float fault_s, float value_V) {
+    Scenario sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.mode = mode;
+    sc.fault_s = fault_s;
+    sc.value_V = value_V;
+    sc.dt_s = 1.0f;
+    sc.request_A = 5.0f;
+    sc.end_s = 4.0f * 3600.0f;
+    sc.r0_scale = 1.0f;
+    sc.r1_scale = 1.0f;
+    sc.tau_scale = 1.0f;
+    sc.capacity_scale = 1.0f;
+    return sc;
+}
+
+static double g_soc_at_first_fault;   /* true SOC of cell 2 when run_scenario() first saw a fault */
+
+static uint16_t run_scenario(const Scenario *sc, double *peak_soc, double *final_soc) {
+    const double socs[EV_NUM_CELLS] = {0.30, 0.30, 0.40, 0.30};
+    const float temps[EV_NUM_CELLS] = {25.0f, 25.0f, 25.0f, 25.0f};
+    Pack pack;
+    EvPackResult result;
+    float command_A = 0.0f;
+    float frozen_V = 0.0f;
+    float t_s;
+    uint16_t flags = 0U;
+    pack_init(&pack, socs, temps);
+    pack.plant_r0_scale = sc->r0_scale;
+    pack.plant_r1_scale = sc->r1_scale;
+    pack.plant_tau_scale = sc->tau_scale;
+    pack.plant_capacity_scale = sc->capacity_scale;
+    pack.adc_lsb_V = 0.001f;
+    *peak_soc = 0.0;
+    g_soc_at_first_fault = -1.0;
+    for (t_s = 0.0f; t_s < sc->end_s; t_s += sc->dt_s) {
+        float applied_A = fmaxf(command_A, sc->floor_A);
+        float pack_V = 0.0f;
+        size_t cell;
+        plant_step(&pack, applied_A, sc->dt_s);
+        for (cell = 0U; cell < EV_NUM_CELLS; ++cell) { pack_V += pack.voltages_V[cell]; }
+        pack_V = roundf(pack_V / 0.01f) * 0.01f;   /* independent string measurement, taken before the cell fault */
+        if ((sc->mode == 1) && (t_s >= sc->fault_s)) {
+            if (frozen_V == 0.0f) { frozen_V = pack.voltages_V[2]; }
+            pack.voltages_V[2] = frozen_V;
+        } else if ((sc->mode == 2) && (t_s >= sc->fault_s)) {
+            pack.voltages_V[2] += sc->value_V;
+        } else if ((sc->mode == 3) && (t_s >= sc->fault_s) && (t_s < sc->fault_s + sc->length_s)) {
+            pack.voltages_V[2] += sc->value_V;
+        } else if ((sc->mode == 4) && (t_s >= sc->fault_s)) {
+            pack.voltages_V[2] += sc->value_V * (t_s - sc->fault_s);   /* drift, V/s */
+        }
+        result = (sc->pack_tolerance_V > 0.0f)
+            ? ev_step_with_pack_voltage(pack.config, pack.state, applied_A, sc->request_A, pack.voltages_V, pack.temperatures_C,
+                                        sc->dt_s, HORIZON_S, pack_V, sc->pack_tolerance_V)
+            : ev_step(pack.config, pack.state, applied_A, sc->request_A, pack.voltages_V, pack.temperatures_C, sc->dt_s, HORIZON_S);
+        if ((flags == 0U) && (result.fault_flags != 0U)) { g_soc_at_first_fault = pack.true_soc[2]; }
+        flags |= result.fault_flags;
+        command_A = result.approved_charge_current_A;
+        *peak_soc = fmax(*peak_soc, pack.true_soc[2]);
+    }
+    *final_soc = pack.true_soc[2];
+    return flags;
+}
+
+/* Round-5 C-safety finding B1: a reading frozen just after the charge tapered off, with the
+ * request still present, let the at-rest window restart feed it back to the EKF; the charge
+ * resumed in a ratchet to 106 % SOC with no fault. */
+static void test_frozen_after_taper_does_not_ratchet(void) {
+    static const float freeze_s[] = {4800.0f, 5400.0f, 6600.0f};
+    double worst = 0.0;
+    double peak;
+    double final_soc;
+    size_t k;
+    for (k = 0U; k < sizeof(freeze_s) / sizeof(freeze_s[0]); ++k) {
+        Scenario sc = scenario(1, freeze_s[k], 0.0f);
+        sc.end_s = 8.0f * 3600.0f;
+        (void)run_scenario(&sc, &peak, &final_soc);
+        worst = fmax(worst, peak);
+    }
+    check(worst < 0.99, "frozen after taper: no overcharge ratchet");
+}
+
+/* Round-5 C-safety finding B2: the charger stop caused by the fault "validated" an offset
+ * reading, cleared the latch and the cell was charged to 106 % SOC. A 30 mV offset stays below
+ * the detection threshold (it is within the allowance for a 30 % R0 error); its effect is bounded. */
+static void test_offset_step_stays_latched(void) {
+    static const float offsets_V[] = {-0.03f, -0.05f, -0.07f};
+    double peak;
+    double final_soc;
+    size_t k;
+    bool safe = true;
+    bool detected = true;
+    for (k = 0U; k < sizeof(offsets_V) / sizeof(offsets_V[0]); ++k) {
+        Scenario sc = scenario(2, 300.0f, offsets_V[k]);
+        sc.request_A = 3.5f;
+        uint16_t flags = run_scenario(&sc, &peak, &final_soc);
+        safe = safe && (peak < 0.99);
+        if (offsets_V[k] <= -0.05f) {
+            detected = detected && ((flags & (EV_FAULT_VOLTAGE_PLAUSIBILITY | EV_FAULT_SOC_DIVERGENCE)) != 0U);
+        }
+    }
+    check(detected, "offset step: 50 and 70 mV steps detected");
+    check(safe, "offset step: fault not cleared by the charger stop, no overcharge");
+}
+
+/* Round-5 C-safety finding H4: a slowly drifting reading moves with the model from one window to
+ * the next. With one voltage channel per cell only the SOC-divergence backstop sees it, and only
+ * once the EKF has left the coulomb count by more than a 20 % capacity error explains: that is a
+ * documented limit (README, Limits), bounded here. The pack-voltage cross-check catches it early. */
+static void test_drifting_reading_is_caught(void) {
+    double peak;
+    double final_soc;
+    Scenario sc = scenario(4, 600.0f, -20.0e-6f);
+    uint16_t flags = run_scenario(&sc, &peak, &final_soc);
+    check((flags & (EV_FAULT_SOC_DIVERGENCE | EV_FAULT_VOLTAGE_PLAUSIBILITY)) != 0U, "drift: -20 uV/s drift detected");
+    check((g_soc_at_first_fault > 0.0) && (peak < 1.06), "drift, single channel: divergence backstop bounds the overcharge");
+    sc.pack_tolerance_V = 0.03f;
+    flags = run_scenario(&sc, &peak, &final_soc);
+    check((flags & EV_FAULT_PACK_VOLTAGE) != 0U, "drift: pack-voltage cross-check detects it");
+    check((g_soc_at_first_fault > 0.0) && (g_soc_at_first_fault < 0.90) && (peak < 0.99), "drift: pack check stops it before overcharge");
+}
+
+/* A frozen reading is caught once the true voltage moves by the tolerance (a freeze in the taper,
+ * where it does not move, is harmless and bounded by test_frozen_after_taper_does_not_ratchet).
+ * An offset below the model-tracking allowance is caught by the pack check;
+ * with a consistent pack reading it raises no fault over the parameter-mismatch grid corners. */
+static void test_pack_voltage_cross_check(void) {
+    static const float caps[] = {0.85f, 1.15f};
+    double peak;
+    double final_soc;
+    uint16_t flags;
+    size_t k;
+    bool clean = true;
+    Scenario sc = scenario(2, 300.0f, -0.03f);
+    sc.request_A = 3.5f;
+    sc.pack_tolerance_V = 0.02f;
+    flags = run_scenario(&sc, &peak, &final_soc);
+    check(((flags & EV_FAULT_PACK_VOLTAGE) != 0U) && (peak < 0.5), "pack check: 30 mV offset detected at once");
+    sc = scenario(1, 1800.0f, 0.0f);
+    sc.pack_tolerance_V = 0.03f;
+    flags = run_scenario(&sc, &peak, &final_soc);
+    check(((flags & EV_FAULT_PACK_VOLTAGE) != 0U) && (peak < 0.99), "pack check: frozen reading detected once the cell moves");
+    sc = scenario(3, 30.0f, 0.040f);
+    sc.dt_s = 0.1f;
+    sc.length_s = 0.3f;
+    sc.end_s = 1800.0f;
+    sc.pack_tolerance_V = 0.03f;
+    flags = run_scenario(&sc, &peak, &final_soc);
+    check((flags & EV_FAULT_PACK_VOLTAGE) == 0U, "pack check: 0.3 s glitch does not latch");
+    for (k = 0U; k < sizeof(caps) / sizeof(caps[0]); ++k) {
+        sc = scenario(0, 0.0f, 0.0f);
+        sc.end_s = 2.0f * 3600.0f;
+        sc.r0_scale = 1.3f;
+        sc.r1_scale = 2.0f;
+        sc.capacity_scale = caps[k];
+        sc.pack_tolerance_V = 0.03f;
+        flags = run_scenario(&sc, &peak, &final_soc);
+        clean = clean && ((flags & EV_FAULT_PACK_VOLTAGE) == 0U) && (final_soc > 0.75);
+    }
+    check(clean, "pack check: no false fault with a consistent pack reading");
+}
+
+static void test_pack_voltage_inputs(void) {
+    Pack pack;
+    const double socs[EV_NUM_CELLS] = {0.5, 0.5, 0.5, 0.5};
+    const float temps[EV_NUM_CELLS] = {25.0f, 25.0f, 25.0f, 25.0f};
+    EvPackResult r;
+    float sum_V;
+    int i;
+    pack_init(&pack, socs, temps);
+    plant_step(&pack, 0.0f, DT_S);
+    sum_V = pack.voltages_V[0] + pack.voltages_V[1] + pack.voltages_V[2] + pack.voltages_V[3];
+    r = ev_step_with_pack_voltage(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, sum_V, 0.0f);
+    check((r.decision == EV_DECISION_FAULT) && ((r.fault_flags & EV_FAULT_INPUT) != 0U), "pack check: zero tolerance is an input fault");
+    r = ev_step_with_pack_voltage(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, NAN, 0.03f);
+    check((r.decision == EV_DECISION_FAULT) && ((r.fault_flags & EV_FAULT_INPUT) != 0U), "pack check: NaN pack voltage is an input fault");
+    for (i = 0; i < 3; ++i) {
+        r = ev_step_with_pack_voltage(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, sum_V + 0.1f, 0.03f);
+    }
+    check((r.fault_flags & EV_FAULT_PACK_VOLTAGE) == 0U, "pack check: needs the confirmation time");
+    for (i = 0; i < 4; ++i) {
+        r = ev_step_with_pack_voltage(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, sum_V + 0.1f, 0.03f);
+    }
+    check((r.decision == EV_DECISION_FAULT) && ((r.fault_flags & EV_FAULT_PACK_VOLTAGE) != 0U), "pack check: sustained mismatch faults");
+    for (i = 0; i < 20; ++i) {
+        r = ev_step_with_pack_voltage(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, sum_V, 0.03f);
+    }
+    check((r.fault_flags & EV_FAULT_PACK_VOLTAGE) != 0U, "pack check: fault stays latched");
+    for (i = 0; i < (int)EV_NUM_CELLS; ++i) { ev_cell_init(&pack.state[i], 0.5, 25.0f); }
+    r = ev_step_with_pack_voltage(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, sum_V, 0.03f);
+    check((r.fault_flags & EV_FAULT_PACK_VOLTAGE) == 0U, "pack check: ev_cell_init clears the latch");
+}
+
+/* Round-5 C-safety finding H2: a 3-sample glitch at a 0.1 s control period latched a fault for
+ * the rest of the run. */
+static void test_short_glitch_does_not_latch(void) {
+    double peak;
+    double final_soc;
+    Scenario sc = scenario(3, 30.0f, 0.040f);
+    uint16_t flags;
+    sc.dt_s = 0.1f;
+    sc.length_s = 0.3f;
+    sc.end_s = 1800.0f;
+    flags = run_scenario(&sc, &peak, &final_soc);
+    check((flags & (EV_FAULT_VOLTAGE_PLAUSIBILITY | EV_FAULT_SOC_DIVERGENCE)) == 0U, "glitch: 0.3 s +40 mV glitch does not fault");
+    check(final_soc > 0.6, "glitch: charging continues");
+}
+
+/* Round-5 C-safety finding H1: combined parameter mismatch inside the stated envelope gave false
+ * plausibility faults in a quarter of the runs. */
+static void test_tracking_mismatch_grid(void) {
+    static const float r0[] = {0.7f, 1.3f};
+    static const float r1[] = {0.5f, 2.0f};
+    static const float tau[] = {0.3f, 3.0f};
+    static const float cap[] = {0.85f, 1.15f};
+    int false_faults = 0;
+    int slow = 0;
+    size_t a;
+    size_t b;
+    size_t c;
+    size_t d;
+    for (a = 0U; a < 2U; ++a) {
+        for (b = 0U; b < 2U; ++b) {
+            for (c = 0U; c < 2U; ++c) {
+                for (d = 0U; d < 2U; ++d) {
+                    double peak;
+                    double final_soc;
+                    Scenario sc = scenario(0, 0.0f, 0.0f);
+                    sc.r0_scale = r0[a];
+                    sc.r1_scale = r1[b];
+                    sc.tau_scale = tau[c];
+                    sc.capacity_scale = cap[d];
+                    sc.end_s = 2.0f * 3600.0f;
+                    if (run_scenario(&sc, &peak, &final_soc) != 0U) { false_faults++; }
+                    if (final_soc < 0.75) { slow++; }
+                }
+            }
+        }
+    }
+    check(false_faults == 0, "tracking: no false fault over the R0/R1/tau/capacity mismatch corners");
+    check(slow == 0, "tracking: every mismatch corner still charges");
+}
+
+/* Round-5 C-safety finding H3: a charger that never goes below 0.49 A (inside the 0.5 A
+ * tolerance) was never flagged and overcharged the cell. */
+static void test_charger_floor_is_detected(void) {
+    double peak;
+    double final_soc;
+    Scenario sc = scenario(0, 0.0f, 0.0f);
+    uint16_t flags;
+    sc.floor_A = 0.49f;
+    sc.end_s = 8.0f * 3600.0f;
+    flags = run_scenario(&sc, &peak, &final_soc);
+    check((flags & EV_FAULT_OVER_CURRENT) != 0U, "charger floor: excess charge flagged as over-current");
+    check((g_soc_at_first_fault > 0.0) && (g_soc_at_first_fault < 0.99), "charger floor: flagged before the cell is overcharged");
+}
+
+/* Round-5 C-safety finding M2: an inconsistent covariance (|P01| > sqrt(P00 P11)) was accepted. */
+static void test_inconsistent_covariance_is_reset(void) {
+    Pack pack;
+    EvPackResult result;
+    pack_uniform(&pack, 0.5, 25.0f);
+    plant_step(&pack, 0.0f, DT_S);
+    pack.state[1].covariance[1] = 1.0;
+    result = ev_step(pack.config, pack.state, 0.0f, 0.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    check((result.fault_flags & EV_FAULT_STATE) != 0U, "state: inconsistent covariance is reset");
+}
+
+/* Round-5 finding: the measured voltage floor left out the OCV and RC rise over the horizon. */
+static void test_measured_floor_covers_horizon(void) {
+    EvCellConfig config = lgm50_config();
+    EvCellState state;
+    EvCellPrediction p;
+    float ocv_now_V = 0.0f;
+    float ocv_end_V = 0.0f;
+    ev_cell_init(&state, 0.85, 25.0f);
+    ev_full_cell_ocv_V_and_dv_dsoc(0.85f, &ocv_now_V, NULL);
+    ev_full_cell_ocv_V_and_dv_dsoc(0.85f + ((5.0f * HORIZON_S) / (5.0f * 3600.0f)), &ocv_end_V, NULL);
+    state.covariance[0] = 1.0e-8;
+    state.last_voltage_V = ocv_now_V + 0.025f;   /* model 25 mV below the reading */
+    (void)ev_predict_cell(&config, &state, 5.0f, HORIZON_S, &p);
+    check(p.terminal_voltage_V >= state.last_voltage_V + (config.resistance_ohm * 5.0f) + (ocv_end_V - ocv_now_V)
+              + (config.rc_resistance_ohm * 5.0f * (1.0f - expf(-HORIZON_S / config.rc_time_constant_s))) - 1.0e-4f,
+          "voltage: measured floor adds the OCV and RC rise over the horizon");
 }
 
 /* Round-4 physics finding: at exactly 45 degC equilibrium the old thermal formula rounded above
@@ -956,6 +1352,19 @@ static bool self_test(void) {
     test_ageing_and_cold_reduce_the_limit();
     test_single_cell_limit_matches_pack();
     test_gradients_remember_previous_current();
+    test_gradient_history_decays_slowly();
+    test_limit_stable_with_current_gain_error();
+    test_soc_jump_after_step_down_keeps_gradients();
+    test_measured_floor_covers_horizon();
+    test_frozen_after_taper_does_not_ratchet();
+    test_offset_step_stays_latched();
+    test_short_glitch_does_not_latch();
+    test_drifting_reading_is_caught();
+    test_pack_voltage_cross_check();
+    test_pack_voltage_inputs();
+    test_tracking_mismatch_grid();
+    test_charger_floor_is_detected();
+    test_inconsistent_covariance_is_reset();
     test_thermal_prediction_exact_at_equilibrium();
     return g_failures == 0;
 }

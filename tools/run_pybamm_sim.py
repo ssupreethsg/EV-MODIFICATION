@@ -4,17 +4,19 @@ Every sample convention follows ev_step(): current_A[i] is the current over (t[i
 
 1. OCV: the C table at PyBaMM's SOC vs PyBaMM's bulk open-circuit voltage (SPMe).
 2. 1-RC fit: R0, R1 and tau are fitted on a 0.5C pulse profile, then checked out of sample on a
-   1C pulse profile (four cycles of 10 min charge + 10 min rest from 10 % SOC, then 1C to 4.2 V).
+   1C pulse profile (four cycles of up to 10 min charge, stopping at 4.2 V, + 10 min rest from
+   10 % SOC, then 1C to 4.2 V).
 3. EKF: the C estimator (ev_cli ekf, through ev_step) starts 0.20 SOC high on the 1C profile, with
-   the fitted parameters and with R0 +/-20 % and capacity -5 % errors. From the first rest period
-   on (15 min) the SOC error must stay below 3 % and inside the filter's own 3-sigma band (at most
-   1 % of samples outside; the controller's SOC limit relies on that band).
-4. Plating: closed loop between the C limiter (ev_cli limit, 3C request, 30 s horizon) and a PyBaMM
-   DFN with Arrhenius electrolyte and diffusion terms, isothermal at 2, 10 and 25 degC, from 5 % SOC.
-   The DFN anode potential vs Li/Li+ (phi_s - phi_e) must stay >= 0 V everywhere in the electrode, and
-   the limiter must still charge (minimum final SOC per temperature). The loop drives
-   ev_cell_max_charge_current with the true SOC (sigma 0, rc 0): it validates the limiter's plating
-   predictor, not the estimator.
+   the fitted parameters and with R0 +/-20 % and capacity -5 % errors. From 15 min on (the end of
+   the first rest) the SOC error must stay below 3 % and inside the filter's own 3-sigma band (at
+   most 1 % of samples outside; the controller's SOC limit relies on that band), and no sample may
+   raise a fault (a healthy cell must never trip the voltage-plausibility check).
+4. Plating: the complete controller (ev_cli charge: ev_step with EKF, gradient history, voltage
+   tracking and over-current supervision, a 15 A (2.9C) request and a 30 s horizon) charges a
+   PyBaMM DFN with Arrhenius electrolyte and diffusion terms in a closed loop, isothermal at 2, 10
+   and 25 degC, from 5 % SOC, with the DFN terminal voltage as the measurement. The DFN anode
+   potential vs Li/Li+ (phi_s - phi_e) must stay >= 0 V everywhere in the electrode, no fault may
+   occur, and the limiter must still charge (minimum final SOC per temperature).
 
 Usage: python tools/run_pybamm_sim.py [--cli PATH] [--out PNG] [--skip-dfn]
 """
@@ -37,7 +39,7 @@ FARADAY = 96485.33212
 INITIAL_SOC = 0.1
 TEMPERATURE_C = 25.0
 EKF_INITIAL_SOC_ERROR = 0.2
-EKF_SETTLE_S = 900.0   # after the first rest: the filter learns SOC mainly at low current
+EKF_SETTLE_S = 900.0   # end of the first rest: the filter learns SOC mainly at low current
 OCV_TOLERANCE_V = 0.001
 RC_FIT_RMS_TOLERANCE_V = 0.025
 EKF_SOC_TOLERANCE = 0.03
@@ -48,6 +50,8 @@ DFN_START_SOC = 0.05
 DFN_STEP_S = 10.0
 DFN_MAX_TIME_S = 2.0 * 3600.0
 DFN_REQUEST_A = 15.0
+DFN_HORIZON_S = 30.0
+VALIDATION_PROFILE = ["Charge at 1C for 10 minutes or until 4.2 V", "Rest for 10 minutes"] * 4 + ["Charge at 1C until 4.2 V"]
 PLATING_ONSET_V = 0.0
 
 
@@ -124,30 +128,38 @@ def run_ekf(cli, params, capacity_Ah, data):
     rows = np.array(m.run_cli(cli, args, lines), dtype=float)
     soc = np.concatenate(([INITIAL_SOC + EKF_INITIAL_SOC_ERROR], rows[:, 0]))
     sigma = np.concatenate(([0.05], rows[:, 1]))
-    return soc, sigma
+    fault_samples = int(np.count_nonzero(rows[:, 4]))
+    return soc, sigma, fault_samples
 
 
 def dfn_closed_loop(cli, temperature_C, params):
-    """C limiter driving a DFN: returns min anode potential vs Li/Li+ [V] and the trace."""
+    """Complete C controller charging a DFN: returns min anode potential vs Li/Li+ [V], the
+    number of cycles with fault flags, and the trace (time, SOC, current, min potential)."""
     parameter_values, capacity_Ah = chen2020(temperature_C, arrhenius=True)
     parameter_values.update({"Current function [A]": "[input]"})
     parameter_values.set_initial_state(DFN_START_SOC)
     sim = pybamm.Simulation(pybamm.lithium_ion.DFN(), parameter_values=parameter_values)
     r0, r1, tau = params
-    process = subprocess.Popen([cli, "limit", f"{capacity_Ah:.6f}", f"{r0:.6f}", f"{r1:.6f}", f"{tau:.6f}", f"{temperature_C:.3f}"],
+    process = subprocess.Popen([cli, "charge", f"{capacity_Ah:.6f}", f"{r0:.6f}", f"{r1:.6f}", f"{tau:.6f}",
+                                f"{DFN_START_SOC:.6f}", f"{temperature_C:.3f}"],
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    soc, elapsed, min_potential = DFN_START_SOC, 0.0, np.inf
+    soc, elapsed, min_potential, faults = DFN_START_SOC, 0.0, np.inf, 0
     trace = []
+    current_A = 0.0   # current over the interval that just ended (a rested start)
     try:
+        sol = sim.step(DFN_STEP_S, inputs={"Current function [A]": 0.0}, save=False)
         while elapsed < DFN_MAX_TIME_S and soc < m.header_constant("EV_MAX_SAFE_SOC"):
-            process.stdin.write(f"{soc:.6f} 0 {temperature_C:.3f} 0 1 {DFN_REQUEST_A} 30\n")
+            voltage_V = float(sol["Voltage [V]"].entries[-1])
+            process.stdin.write(f"{DFN_STEP_S} {current_A:.6f} {voltage_V:.6f} {temperature_C:.3f} {DFN_REQUEST_A} {DFN_HORIZON_S}\n")
             process.stdin.flush()
             line = process.stdout.readline()
             if not line:
-                raise RuntimeError("ev_cli limit stopped responding")
-            current_A = float(line.split()[0])
-            if current_A < 0.01:
-                break
+                raise RuntimeError("ev_cli charge stopped responding")
+            fields = line.split()
+            current_A, flags = float(fields[0]), int(fields[2])
+            faults += int(flags != 0)
+            if current_A < 0.01 and trace:
+                break   # end of charge (or a fault, which is counted)
             sol = sim.step(DFN_STEP_S, inputs={"Current function [A]": -current_A}, save=False)
             potential = sol["Negative electrode surface potential difference [V]"].entries[:, -1]
             min_potential = min(min_potential, float(np.min(potential)))
@@ -157,7 +169,7 @@ def dfn_closed_loop(cli, temperature_C, params):
     finally:
         process.stdin.close()
         process.wait()
-    return min_potential, np.array(trace)
+    return min_potential, faults, np.array(trace)
 
 
 def plot(out_path, val, rc_voltage_V, rc_rms, ekf_soc, ekf_sigma, dfn_traces):
@@ -212,7 +224,7 @@ def main():
 
     fit, _ = simulate_spme(["Charge at 0.5C for 15 minutes", "Rest for 15 minutes"] * 3 + ["Charge at 0.5C until 4.2 V"])
     params = fit_rc(fit, c_ocv(cli, fit["soc"]))
-    val, capacity_Ah = simulate_spme(["Charge at 1C for 10 minutes", "Rest for 10 minutes"] * 4 + ["Charge at 1C until 4.2 V"])
+    val, capacity_Ah = simulate_spme(VALIDATION_PROFILE)
     val_ocv = c_ocv(cli, val["soc"])
     ocv_error = float(np.max(np.abs(val_ocv - val["bulk_ocv_V"])))
     rc_voltage_V = rc_model_voltage(params, val["time_s"], val["current_A"], val_ocv)
@@ -225,18 +237,19 @@ def main():
     cases = [("fitted", params, capacity_Ah), ("R0 +20 %", params * [1.2, 1, 1], capacity_Ah),
              ("R0 -20 %", params * [0.8, 1, 1], capacity_Ah), ("capacity -5 %", params, 0.95 * capacity_Ah)]
     for name, case_params, case_capacity in cases:
-        ekf_soc, ekf_sigma = run_ekf(cli, case_params, case_capacity, val)
+        ekf_soc, ekf_sigma, fault_samples = run_ekf(cli, case_params, case_capacity, val)
         error = np.abs(ekf_soc - val["soc"])[settled]
         outside = float(np.mean(error > 3.0 * ekf_sigma[settled]))
         checks.append((f"EKF ({name}) max SOC error after {EKF_SETTLE_S:.0f} s", float(np.max(error)), EKF_SOC_TOLERANCE))
         checks.append((f"EKF ({name}) fraction outside 3 sigma", outside, EKF_MAX_FRACTION_OUTSIDE_3SIGMA))
+        checks.append((f"EKF ({name}) samples with a fault", fault_samples, 0))
         if nominal is None:
             nominal = (ekf_soc, ekf_sigma)
 
     dfn_traces = []
     if not args.skip_dfn:
         for temperature_C in DFN_TEMPERATURES_C:
-            min_potential, trace = dfn_closed_loop(cli, temperature_C, params)
+            min_potential, faults, trace = dfn_closed_loop(cli, temperature_C, params)
             dfn_traces.append((temperature_C, trace))
             final_soc = trace[-1, 1] if trace.size else DFN_START_SOC
             if not trace.size:
@@ -246,6 +259,7 @@ def main():
                            -min_potential, -PLATING_ONSET_V))
             checks.append((f"DFN {temperature_C:.0f} degC final SOC (>= {DFN_MIN_FINAL_SOC[temperature_C]})",
                            -final_soc, -DFN_MIN_FINAL_SOC[temperature_C]))
+            checks.append((f"DFN {temperature_C:.0f} degC cycles with a fault", faults, 0))
 
     print(f"SOC window capacity {capacity_Ah:.4f} Ah; fitted 1-RC: R0 = {params[0] * 1000:.2f} mOhm, "
           f"R1 = {params[1] * 1000:.2f} mOhm, tau = {params[2]:.1f} s")
@@ -253,7 +267,7 @@ def main():
     for name, value, limit in checks:
         passed = value <= limit
         ok = ok and passed
-        shown = -value if name.startswith("DFN") else value
+        shown = -value if (name.startswith("DFN") and "fault" not in name) else value
         print(f"{'PASS' if passed else 'FAIL'}: {name} = {shown:.4f}")
 
     plot(args.out, val, rc_voltage_V, rc_rms, nominal[0], nominal[1], dfn_traces)

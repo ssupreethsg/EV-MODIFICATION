@@ -12,8 +12,16 @@
  *
  *   ev_cli ekf <capacity_Ah> <r0_ohm> <r1_ohm> <tau_s> <initial_soc> <initial_temperature_C>
  *       stdin : "<dt_s> <current_A> <voltage_V> <temperature_C>" per line (positive = charge)
- *       stdout: "<soc> <soc_sigma> <rc_voltage_V> <decision>" per line, running ev_step() on a
- *               pack of identical cells with a 0 A request and a 30 s horizon
+ *       stdout: "<soc> <soc_sigma> <rc_voltage_V> <decision> <fault_flags>" per line, running
+ *               ev_step() on a pack of identical cells with a 0 A request and a 30 s horizon; the
+ *               measured current is not supervised (there is no charger to follow)
+ *
+ *   ev_cli charge <capacity_Ah> <r0_ohm> <r1_ohm> <tau_s> <initial_soc> <initial_temperature_C>
+ *       stdin : "<dt_s> <current_A> <voltage_V> <temperature_C> <request_A> <horizon_s>" per line
+ *       stdout: "<approved_A> <decision> <fault_flags> <soc> <soc_sigma>" per line: the complete
+ *               controller in a closed loop (ev_step() with the state carried between lines: EKF,
+ *               gradient history, voltage tracking, over-current check). current_A is the current
+ *               that flowed over the dt_s that just ended, voltage_V the reading at its end.
  *
  * Exits 2 on a usage error and 3 on malformed, out-of-range or overlong (> EV_CLI_LINE_LENGTH - 2
  * characters) input lines (with a message on stderr).
@@ -24,9 +32,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "spme_v7_apex_solver.h"
+#include "ev_modify.h"
 
 #define EV_CLI_MAX_FIELDS 7
+#define EV_CLI_MAX_DT_S 60.0
 #define EV_CLI_LINE_LENGTH 512
 
 /* Parses exactly `count` finite numbers from `text`; returns 0 on success. */
@@ -128,7 +137,9 @@ static int ev_run_limit(char *argv[]) {
         ++line_number;
         if ((ev_parse_numbers(line, f, 7) != 0) || (f[0] < 0.0) || (f[0] > 1.0) || (f[1] < 0.0) || (f[1] > 0.5)
             || (f[2] < (double)EV_MIN_PLAUSIBLE_TEMPERATURE_C) || (f[2] > (double)EV_MAX_PLAUSIBLE_TEMPERATURE_C)
-            || (f[3] < -1.0) || (f[3] > 1.0) || (f[4] < EV_MIN_SOH) || (f[4] > 1.0) || (f[5] < 0.0) || (f[6] <= 0.0)) {
+            || (f[3] < -1.0) || (f[3] > 1.0) || (f[4] < EV_MIN_SOH) || (f[4] > 1.0)
+            || (f[5] < 0.0) || (f[5] > (double)EV_MAX_PLAUSIBLE_CURRENT_A)
+            || (f[6] <= 0.0) || (f[6] > (double)EV_MAX_PREDICTION_HORIZON_S)) {
             fprintf(stderr, "line %lu: expected '<soc> <soc_sigma> <temperature_C> <rc_voltage_V> <soh> <request_A> <horizon_s>'\n", line_number);
             return 3;
         }
@@ -144,13 +155,16 @@ static int ev_run_limit(char *argv[]) {
     return (status < 0) ? 3 : 0;
 }
 
-static int ev_run_ekf(char *argv[]) {
+/* Replays measurements through ev_step() on a pack of identical cells. closed_loop: each line
+ * also carries the request and horizon, and the charger is supervised against the approvals. */
+static int ev_run_pack(char *argv[], int closed_loop) {
     EvCellConfig config[EV_NUM_CELLS];
     EvCellState state[EV_NUM_CELLS];
     double initial_soc;
     double initial_temperature_C;
     char line[EV_CLI_LINE_LENGTH];
     unsigned long line_number = 0UL;
+    int field_count = closed_loop ? 6 : 4;
     unsigned int i;
     int status;
 
@@ -172,25 +186,43 @@ static int ev_run_ekf(char *argv[]) {
     }
 
     while ((status = ev_read_line(line, (int)sizeof(line), line_number + 1UL)) > 0) {
-        double fields[EV_CLI_MAX_FIELDS];
+        double f[EV_CLI_MAX_FIELDS];
         float voltages_V[EV_NUM_CELLS];
         float temperatures_C[EV_NUM_CELLS];
+        float request_A = 0.0f;
+        float horizon_s = 30.0f;
         EvPackResult result;
         ++line_number;
-        if (ev_parse_numbers(line, fields, 4) != 0) {
-            fprintf(stderr, "line %lu: expected '<dt_s> <current_A> <voltage_V> <temperature_C>'\n", line_number);
+        if ((ev_parse_numbers(line, f, field_count) != 0) || (f[0] <= 0.0) || (f[0] > EV_CLI_MAX_DT_S)
+            || (fabs(f[1]) > (double)EV_MAX_PLAUSIBLE_CURRENT_A)
+            || (closed_loop && ((f[4] < 0.0) || (f[4] > (double)EV_MAX_PLAUSIBLE_CURRENT_A)
+                                || (f[5] <= 0.0) || (f[5] > (double)EV_MAX_PREDICTION_HORIZON_S)))) {
+            fprintf(stderr, closed_loop
+                ? "line %lu: expected '<dt_s> <current_A> <voltage_V> <temperature_C> <request_A> <horizon_s>' in range\n"
+                : "line %lu: expected '<dt_s> <current_A> <voltage_V> <temperature_C>' in range\n", line_number);
             return 3;
         }
         for (i = 0U; i < EV_NUM_CELLS; ++i) {
-            voltages_V[i] = (float)fields[2];
-            temperatures_C[i] = (float)fields[3];
-            /* the estimator replay has no charger to supervise */
-            state[i].commanded_current_A = EV_MAX_PLAUSIBLE_CURRENT_A;
-            state[i].ramp_from_A = EV_MAX_PLAUSIBLE_CURRENT_A;
+            voltages_V[i] = (float)f[2];
+            temperatures_C[i] = (float)f[3];
+            if (!closed_loop) {
+                /* the estimator replay has no charger to supervise */
+                state[i].commanded_current_A = EV_MAX_PLAUSIBLE_CURRENT_A;
+                state[i].ramp_from_A = EV_MAX_PLAUSIBLE_CURRENT_A;
+            }
         }
-        result = ev_step(config, state, (float)fields[1], 0.0f, voltages_V, temperatures_C, (float)fields[0], 30.0f);
-        printf("%.6f %.6f %.6f %u\n", state[0].soc, sqrt(state[0].covariance[0]), (double)state[0].rc_voltage_V,
-               (unsigned)result.decision);
+        if (closed_loop) {
+            request_A = (float)f[4];
+            horizon_s = (float)f[5];
+        }
+        result = ev_step(config, state, (float)f[1], request_A, voltages_V, temperatures_C, (float)f[0], horizon_s);
+        if (closed_loop) {
+            printf("%.6f %u %u %.6f %.6f\n", (double)result.approved_charge_current_A, (unsigned)result.decision,
+                   (unsigned)result.fault_flags, state[0].soc, sqrt(state[0].covariance[0]));
+        } else {
+            printf("%.6f %.6f %.6f %u %u\n", state[0].soc, sqrt(state[0].covariance[0]), (double)state[0].rc_voltage_V,
+                   (unsigned)result.decision, (unsigned)result.fault_flags);
+        }
         fflush(stdout);
     }
     return (status < 0) ? 3 : 0;
@@ -204,10 +236,14 @@ int main(int argc, char *argv[]) {
         return ev_run_limit(&argv[2]);
     }
     if ((argc == 8) && (strcmp(argv[1], "ekf") == 0)) {
-        return ev_run_ekf(&argv[2]);
+        return ev_run_pack(&argv[2], 0);
+    }
+    if ((argc == 8) && (strcmp(argv[1], "charge") == 0)) {
+        return ev_run_pack(&argv[2], 1);
     }
     fprintf(stderr, "usage: ev_cli ocv\n"
                     "       ev_cli limit <capacity_Ah> <r0_ohm> <r1_ohm> <tau_s> <coolant_temperature_C>\n"
-                    "       ev_cli ekf <capacity_Ah> <r0_ohm> <r1_ohm> <tau_s> <initial_soc> <initial_temperature_C>\n");
+                    "       ev_cli ekf <capacity_Ah> <r0_ohm> <r1_ohm> <tau_s> <initial_soc> <initial_temperature_C>\n"
+                    "       ev_cli charge <capacity_Ah> <r0_ohm> <r1_ohm> <tau_s> <initial_soc> <initial_temperature_C>\n");
     return 2;
 }
