@@ -57,6 +57,8 @@ typedef struct {
     float plant_tau_scale;           /* plant tau = scale * configured tau */
     float plant_capacity_scale;      /* plant capacity = scale * configured capacity */
     float adc_lsb_V;                 /* voltage quantisation (0 = none) */
+    float plant_ocv_error_V;         /* amplitude of a sinusoidal plant OCV error (OCV fit error) */
+    float plant_ocv_error_period;    /* its period in SOC */
     float voltages_V[EV_NUM_CELLS];
     float temperatures_C[EV_NUM_CELLS];
 } Pack;
@@ -107,6 +109,9 @@ static void plant_step(Pack *pack, float current_A, float dt_s) {
         pack->true_rc_V[i] = (a * pack->true_rc_V[i])
             + ((double)c->rc_resistance_ohm * (double)pack->plant_r1_scale * scale * (1.0 - a) * (double)current_A);
         ev_full_cell_ocv_V_and_dv_dsoc((float)pack->true_soc[i], &ocv, NULL);
+        if (pack->plant_ocv_error_V > 0.0f) {
+            ocv += pack->plant_ocv_error_V * (float)sin(6.283185307 * pack->true_soc[i] / (double)pack->plant_ocv_error_period);
+        }
         pack->voltages_V[i] = ocv + (float)pack->true_rc_V[i] + (float)((double)pack->plant_r0_scale * (double)c->resistance_ohm * scale * (double)current_A);
         if (pack->adc_lsb_V > 0.0f) {
             pack->voltages_V[i] = roundf(pack->voltages_V[i] / pack->adc_lsb_V) * pack->adc_lsb_V;
@@ -804,9 +809,9 @@ static void test_horizon_covers_control_period(void) {
     plant_step(&a, 0.0f, 10.0f);
     plant_step(&b, 0.0f, 10.0f);
     short_horizon = ev_step(a.config, a.state, 0.0f, 20.0f, a.voltages_V, a.temperatures_C, 10.0f, 0.001f);
-    long_horizon = ev_step(b.config, b.state, 0.0f, 20.0f, b.voltages_V, b.temperatures_C, 10.0f, 10.0f);
+    long_horizon = ev_step(b.config, b.state, 0.0f, 20.0f, b.voltages_V, b.temperatures_C, 10.0f, 10.0f + EV_OVER_CURRENT_RAMP_S);
     check(short_horizon.approved_charge_current_A == long_horizon.approved_charge_current_A,
-          "horizon: never shorter than the control period");
+          "horizon: never shorter than the control period plus the charger ramp-down");
 }
 
 static void test_cold_charge_hysteresis(void) {
@@ -1635,6 +1640,47 @@ static void test_restored_state_is_validated(void) {
     check((r.fault_flags & EV_FAULT_STATE) == 0U, "restore: the reset repairs the pack-mismatch timer");
 }
 
+/* Round-9 finding: the plant used the controller's own OCV table, so a real cell's OCV that
+ * differs from the fitted table was never tested. A healthy cell whose OCV is off by a sinusoidal
+ * error over SOC (10 mV over 0.33 SOC, or 5 mV over 0.2 SOC: OCV-slope errors up to about
+ * 0.19 V per unit SOC) must charge through CC-CV without any latched fault, across the
+ * parameter-mismatch corners. Larger OCV fit errors can latch (an availability limit, documented). */
+static void test_ocv_fit_error_does_not_latch(void) {
+    static const float periods[] = {0.2f, 0.33f};
+    static const float amplitudes_V[] = {0.005f, 0.010f};
+    static const float corners[][4] = {   /* capacity, R0, R1, tau scales */
+        {1.0f, 1.0f, 1.0f, 1.0f}, {0.9f, 1.3f, 2.0f, 0.3f}, {0.85f, 1.3f, 2.0f, 1.0f}, {1.1f, 0.7f, 0.5f, 3.0f}};
+    uint16_t flags = 0U;
+    double worst_soc = 1.0;
+    size_t p;
+    size_t c;
+    for (p = 0U; p < sizeof(periods) / sizeof(periods[0]); ++p) {
+        for (c = 0U; c < sizeof(corners) / sizeof(corners[0]); ++c) {
+            Pack pack;
+            EvPackResult r;
+            float applied_A = 0.0f;
+            uint32_t t;
+            pack_uniform(&pack, 0.2, 25.0f);
+            pack.plant_capacity_scale = corners[c][0];
+            pack.plant_r0_scale = corners[c][1];
+            pack.plant_r1_scale = corners[c][2];
+            pack.plant_tau_scale = corners[c][3];
+            pack.plant_ocv_error_V = amplitudes_V[p];
+            pack.plant_ocv_error_period = periods[p];
+            pack.adc_lsb_V = 0.001f;
+            for (t = 0U; t < 5U * 3600U; ++t) {
+                r = pack_step(&pack, applied_A, 3.5f);
+                flags |= r.fault_flags;
+                applied_A = r.approved_charge_current_A;
+            }
+            worst_soc = fmin(worst_soc, pack.true_soc[0]);
+        }
+    }
+    check((flags & (EV_FAULT_VOLTAGE_PLAUSIBILITY | EV_FAULT_SOC_DIVERGENCE)) == 0U,
+          "OCV fit error: a fitted-OCV error latches no plausibility or divergence fault");
+    check(worst_soc > 0.85, "OCV fit error: the pack still charges");
+}
+
 static bool self_test(void) {
     test_ocv_table();
     test_closed_loop_charge_to_full();
@@ -1688,6 +1734,7 @@ static bool self_test(void) {
     test_pack_block_reported_everywhere();
     test_frozen_with_periodic_invalid_samples_latches();
     test_restored_state_is_validated();
+    test_ocv_fit_error_does_not_latch();
     test_inconsistent_covariance_is_reset();
     test_thermal_prediction_exact_at_equilibrium();
     return g_failures == 0;

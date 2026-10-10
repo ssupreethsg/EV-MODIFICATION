@@ -590,7 +590,9 @@ bool ev_predict_cell(const EvCellConfig *config, const EvCellState *state, float
 
 /* Highest current that can flow for a command without any fault: the measured current may sit
  * at the fast over-current threshold (command x 1.05 + C/50) while the sensor under-reads by its
- * offset (C/100). Every limit is computed at this current, so no accepted excess is unbudgeted. */
+ * offset (C/100). Every limit is computed at this current. The one accepted excess it does not
+ * cover is the charger's ramp-down after a lower command (EV_OVER_CURRENT_RAMP_S): that current
+ * belongs to the previous approval, whose own check spanned at least dt + the ramp time. */
 static float ev_current_offset_A(const EvCellConfig *config) {
     return EV_CURRENT_OFFSET_C_RATE * config->nominal_capacity_Ah;
 }
@@ -1063,7 +1065,8 @@ static uint16_t ev_update_cell(const EvCellConfig *config, EvCellState *state, f
      * collapse and oscillate), while a real over-current beyond the tolerance is a fault anyway. */
     if (ev_in_range(state->temperature_C, EV_MIN_PLAUSIBLE_TEMPERATURE_C, EV_MAX_PLAUSIBLE_TEMPERATURE_C)) {
         float history_K = ev_model_temperature_K(state->temperature_C);
-        float driver_A = ev_clamp(fminf(current_A, ev_delivered_current_bound_A(config, ev_expected_current_A(state, dt_s))), 0.0f, EV_MAX_PLAUSIBLE_CURRENT_A);
+        float true_A = (current_A > 0.0f) ? (current_A + ev_current_offset_A(config)) : current_A;   /* sensor may read C/100 low */
+        float driver_A = ev_clamp(fminf(true_A, ev_delivered_current_bound_A(config, ev_expected_current_A(state, dt_s))), 0.0f, EV_MAX_PLAUSIBLE_CURRENT_A);
         state->solid_history_current_A = ev_decay_history_A(state->solid_history_current_A, driver_A, dt_s,
                                                             ev_solid_relaxation_s(history_K));
         state->electrolyte_history_current_A = ev_decay_history_A(state->electrolyte_history_current_A, driver_A, dt_s,
@@ -1257,7 +1260,7 @@ static EvPackResult ev_step_unrecorded(const EvCellConfig config[EV_NUM_CELLS], 
 
     /* The approved current flows for at least one control period. */
     result.approved_charge_current_A = ev_find_safe_charge_current(config, state, (uint8_t)EV_NUM_CELLS,
-        result.requested_charge_current_A, fmaxf(prediction_horizon_s, control_dt_s),
+        result.requested_charge_current_A, fmaxf(prediction_horizon_s, control_dt_s + EV_OVER_CURRENT_RAMP_S),
         &limiting_index, &limiting_constraints, &limiting_prediction);
     result.limiting_cell_index = limiting_index;
     result.limiting_anode_potential_V = limiting_prediction.anode_potential_V;

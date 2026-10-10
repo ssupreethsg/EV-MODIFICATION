@@ -76,7 +76,9 @@ extern "C" {
 #define EV_TRACK_REST_C_RATE 0.02f           /* below this |current| / capacity [1/h] the cell counts as at rest */
 /* Measured charge current must follow the approved command (charger ignoring the limit). Every
  * limit is computed at the highest current that can flow without a fault: the command plus this
- * tolerance plus the current-sensor offset, so no excess the fault logic accepts is unbudgeted. */
+ * tolerance plus the current-sensor offset, so no steady excess the fault logic accepts is
+ * unbudgeted. The 2 s ramp-down after a lower command belongs to the previous approval, which was
+ * checked over at least dt + 2 s. */
 #define EV_OVER_CURRENT_TOLERANCE_C_RATE 0.02f /* allowed excess over the approved current, as a C-rate ... */
 #define EV_OVER_CURRENT_TOLERANCE_REL 0.05f  /* ... plus this fraction of it */
 #define EV_OVER_CURRENT_RAMP_S 2.0f          /* after a lower command the charger may ramp down linearly over this time */
@@ -141,7 +143,9 @@ extern "C" {
 #define EV_DIFFUSION_POTENTIAL_FACTOR 1.85f
 #define EV_ELECTROLYTE_CONDUCTIVITY_S_M 0.9487f
 #define EV_ELECTROLYTE_DIFFUSIVITY_M2_S 1.769e-10f
-/* Nyman2008 has no temperature dependence; 17 kJ/mol as in PyBaMM OKane2022 (Ecker2015) */
+/* Nyman2008 has no temperature dependence; 17 kJ/mol as in PyBaMM OKane2022 (Ecker2015). This is
+ * not a worst-case bound: the DFN check runs the electrolyte at 30 kJ/mol as well, and the plating
+ * margin holds there (the electrolyte terms are a small part of the cold overpotential). */
 #define EV_ELECTROLYTE_ACTIVATION_ENERGY_J_MOL 17000.0f
 #define EV_ELECTROLYTE_DIFFUSIVITY_ACTIVATION_J_MOL 17000.0f
 /* R0 and R1 are fitted at 25 degC and scaled like the electrolyte conductivity (placeholder until
@@ -252,7 +256,7 @@ typedef struct {
 #define EV_FAULT_TEMPERATURE_SENSOR 0x08U
 #define EV_FAULT_OVER_TEMPERATURE 0x10U
 #define EV_FAULT_UNDER_TEMPERATURE 0x20U
-#define EV_FAULT_STATE 0x40U          /* non-finite estimator state (reset applied) */
+#define EV_FAULT_STATE 0x40U          /* restored state out of range or a flag byte not 0/1 (reset applied); another layout_version (until ev_cell_init()) */
 #define EV_FAULT_HOLD 0x80U           /* condition cleared, waiting EV_FAULT_HOLD_CYCLES */
 #define EV_FAULT_OVER_VOLTAGE 0x100U  /* measured cell voltage above 4.2 V + margin */
 #define EV_FAULT_VOLTAGE_PLAUSIBILITY 0x200U /* voltage inconsistent with the model (e.g. stuck sensor) */
@@ -303,8 +307,10 @@ typedef struct {
 void ev_cell_init(EvCellState *state, double initial_soc, float initial_temperature_C);
 
 /* Service action after the faulty sensor has been repaired: clears the latched faults
- * (EV_FAULT_VOLTAGE_PLAUSIBILITY tracking latch, EV_FAULT_SOC_DIVERGENCE, EV_FAULT_PACK_VOLTAGE)
- * and keeps SOH, resistance growth and throughput. The SOC sigma is set to 0.5, so the EKF
+ * (EV_FAULT_VOLTAGE_PLAUSIBILITY tracking and suspect-charge latches, the intermittent
+ * EV_FAULT_VOLTAGE_SENSOR latch, EV_FAULT_SOC_DIVERGENCE, EV_FAULT_PACK_VOLTAGE), the
+ * pack-unavailable block and the over-charge integral, and keeps SOH, resistance growth and
+ * throughput. The SOC sigma is set to 0.5, so the EKF
  * re-learns the SOC from the repaired reading (at rest within a cycle) before charge is allowed
  * on it. Does nothing to an invalid state. */
 void ev_clear_latched_faults(EvCellState *state);

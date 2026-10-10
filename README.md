@@ -13,7 +13,7 @@ EV MODIFY is a C11 battery-management function that limits the charge current of
    - optionally, `ev_step_with_pack_voltage()` compares the sum of the cell readings with an independent string-voltage measurement (see Sensor limits below);
    - temperature, capacity fade (SOH) and resistance growth are updated alongside it (open-loop ageing models, not estimated from data);
 3. detects faults, with hysteresis and a 5-cycle hold. This includes a check that the measured current follows the previous approved current, allowing the charger 2 s to ramp down;
-4. finds the largest charge current up to the request that keeps **every** cell inside all constraints for max(horizon, control period). The search is a 20-step upward sweep followed by 24 bisection steps.
+4. finds the largest charge current up to the request that keeps **every** cell inside all constraints for max(horizon, control period + the 2 s charger ramp-down). The search is a 20-step upward sweep followed by 24 bisection steps.
 
 | Constraint (per cell) | Limit | Flag |
 |---|---|---|
@@ -49,7 +49,7 @@ Every fault that is not latched, including pack-level input faults, is held unti
 
 ```
 src/ev_modify.{h,c}         controller library (public API documented in the header)
-tests/test_solver.c         C self-test (196 checks) and demo
+tests/test_solver.c         C self-test (198 checks) and demo
 tests/test_ocv.py           OCV table / stoichiometry checks
 tests/cli/                  ev_cli exit-code and output tests (run by CTest through cmake -P)
 tests/consumer/             find_package / add_subdirectory consumer used by CI
@@ -135,16 +135,17 @@ With an independent measurement of the string voltage (a second AFE channel or t
 | Same sweep: maximum DFN terminal voltage | 3.826 / 3.962 / 4.172 V | ≤ 4.205 V |
 | Cold constant-voltage taper: 2 °C from 75 % SOC, harshest corner | +40.0 mV, 4.132 V, 85.7 % SOC | ≥ 5 mV, ≤ 4.205 V |
 | Sensor errors at their limits: cell at 0 °C while its sensor reads 2 °C, harshest corner, from 5 % SOC | +28.1 mV, 43.6 % SOC, no fault | ≥ 5 mV, ≥ 5 % SOC charged |
-| Same, from 50 % SOC, charger delivering 1.05 × command + 0.99 × C/50 while the current sensor reads C/100 low | +21.1 mV; only the over-charge integral faults, after 2580 s | ≥ 5 mV, no fault before 1500 s |
+| Same sensors, from 50 % SOC, charger delivering 1.05 × command + 0.99 × C/50 while the current sensor reads C/100 low | +21.1 mV; only the over-charge integral faults, after 2580 s | ≥ 5 mV, no fault before 1500 s |
 | Same, charger at 1.05 × command + 1.5 × C/50 (outside the tolerance) | over-current fault at the first 10 s step, +27.6 mV | fault ≤ 30 s, ≥ 5 mV |
-| O'Regan2022's graphite diffusivity and exchange current (a second parameterisation of the same cell, with its own temperature dependence) at 10 / 25 °C | +74.4 / +56.4 mV | ≥ 5 mV |
+| Same sensors, charger at 1.05 × command + 1.99 × C/100 (the highest current that never faults), from 5 % and from 75 % SOC | +18.0 / +18.5 mV, no fault | ≥ 5 mV, 0 faults |
+| O'Regan2022's graphite diffusivity and exchange current (a second parameterisation of the same cell, with their own temperature dependence; electrolyte 30 kJ/mol) at 2 °C, at 0 °C with the 2 °C sensor error, and at 25 °C | +96.3 / +92.9 / +56.4 mV | ≥ 5 mV |
 | Lumped-thermal DFN at 25 °C, controller fed the DFN cell temperature | +37.2 mV, peak 34.8 °C | ≥ 5 mV, ≤ 45 °C |
 | Nominal cases: SOC reached in 2 h, so a limiter that never charges cannot pass | 46.8 / 65.1 / 94.9 % | ≥ 42 / 60 / 90 % |
 | Every other closed-loop case: control cycles with any fault flag | 0 | 0 |
 
 ![PyBaMM benchmark](docs/pybamm_charge_benchmark.png)
 
-The DFN uses PyBaMM's ideal-solution electrolyte (thermodynamic factor 1), so the controller's measured-electrolyte diffusion-potential factor shows up as extra margin here. The DFN loop measures only what a BMS measures (current, terminal voltage, temperature) and starts from the true SOC, as after a rest. The C self-test (196 checks, 98.9 % line coverage of the controller) uses the controller's own model as its plant, including parameter-mismatch and fault-injection cases. PyBaMM is the independent reference: its electrode and electrolyte parameters are the published Chen2020 set, and its temperature dependences (electrolyte, solid diffusion, exchange current) are swept rather than copied from the controller, and its plating floor is the controller's own 5 mV margin rather than 0 V. Neither replaces experimental plating validation.
+The DFN uses PyBaMM's ideal-solution electrolyte (thermodynamic factor 1), so the controller's measured-electrolyte diffusion-potential factor shows up as extra margin here. The DFN loop measures only what a BMS measures (current, terminal voltage, temperature) and starts from the true SOC, as after a rest. The C self-test (198 checks, ≥ 98 % line coverage of the controller) uses the controller's own model as its plant, including parameter-mismatch and fault-injection cases. PyBaMM is the independent reference: its electrode and electrolyte parameters are the published Chen2020 set, and its temperature dependences (electrolyte, solid diffusion, exchange current) are swept rather than copied from the controller, and its plating floor is the controller's own 5 mV margin rather than 0 V. Neither replaces experimental plating validation.
 
 ## Model and parameter provenance
 
@@ -153,7 +154,7 @@ The DFN uses PyBaMM's ideal-solution electrolyte (thermodynamic factor 1), so th
   - particle radius, thickness, active fraction, diffusivity and maximum concentration;
   - the exchange-current coefficient and its 35 kJ/mol activation energy.
 
-  The electrolyte values (conductivity, diffusivity, t+) are Nyman2008 at 1 mol/L, with 17 kJ/mol activation energies as in PyBaMM `OKane2022` (Ecker2015). The concentration overpotential uses (1 − t+)(1 + d ln f/d ln c) = 1.85, the upper bound of measured LiPF6 in EC:EMC 3:7 at ≤ 1 mol/L and −10 to 45 °C (Landesfeind & Gasteiger 2019, via PyBaMM `ORegan2022`). Chen2020's ideal-solution value of 0.74 understates the term by 2.1–2.5×. The OCV tables are generated from the Chen2020 OCP functions on a 201-point grid. Interpolation error is ≤ 2.4 mV overall and ≤ 0.2 mV above 10 % SOC.
+  The electrolyte values (conductivity, diffusivity, t+) are Nyman2008 at 1 mol/L, with 17 kJ/mol activation energies as in PyBaMM `OKane2022` (Ecker2015). Unlike the graphite terms this is not a worst-case bound; the DFN check also runs the electrolyte at 30 kJ/mol, with margin. The concentration overpotential uses (1 − t+)(1 + d ln f/d ln c) = 1.85, the upper bound of measured LiPF6 in EC:EMC 3:7 at ≤ 1 mol/L and −10 to 45 °C (Landesfeind & Gasteiger 2019, via PyBaMM `ORegan2022`). Chen2020's ideal-solution value of 0.74 understates the term by 2.1–2.5×. The OCV tables are generated from the Chen2020 OCP functions on a 201-point grid. Interpolation error is ≤ 2.4 mV overall and ≤ 0.2 mV above 10 % SOC.
 - **Placeholders without a source.**
   - The activation energy of graphite diffusion. Chen2020 gives none; reported values range from about 17 (O'Regan2022) to 43 kJ/mol (Mohtat2020). The controller uses 60 kJ/mol below 25 °C and 17 kJ/mol above, the smallest diffusivity on either side.
   - The graphite exchange-current activation energy. Reported values range from 35 kJ/mol (Chen2020) to about 53 kJ/mol (Ecker2015); the controller uses 60 kJ/mol below 25 °C and 35 kJ/mol above, the smallest exchange current on either side. This and the diffusion bound are why cold charging is slow (≈0.19C at 5 °C).
@@ -182,11 +183,13 @@ The DFN uses PyBaMM's ideal-solution electrolyte (thermodynamic factor 1), so th
 
 With one voltage channel per cell, some sensor faults look the same as model error, so `ev_step()` can only bound them. The self-test checks each bound, and prints the measured values for the frozen-taper, offset, drift and charger-tolerance cases (`test_solver --self-test`):
 
-- an offset of 50 mV or more is detected; a 30 mV offset is inside the 30 % R0 allowance and is not detected, but the reading becomes suspect and the growing SOC uncertainty ends the charge early;
+- an offset of 50 mV or more is detected at once; a 30 mV offset is inside the 30 % R0 allowance and is not detected by the tracking threshold, but the reading becomes suspect, the growing SOC uncertainty ends the charge early and the suspect-charge latch raises `EV_FAULT_VOLTAGE_PLAUSIBILITY` (peak true SOC about 55 % in the self-test);
 - a reading frozen during the constant-voltage taper, where the current changes slowly, can stay inside the tracking tolerance. It cannot restart the charge, and the coulomb-count floor on the upper SOC bound stops it: the worst case in the self-test peaks at about 101 % true SOC (the floor allows 98 % plus 3σ of the last validated SOC and 5 % of the charge since);
 - a slow drift (−20 µV/s) is caught only by the SOC-divergence backstop, at about 105 % true SOC (the test bounds it below 106 %);
 - a current-sensor gain error inside the 5 % over-current tolerance is not detected; the limits are computed at the current the charger may deliver with that error, so it does not erode the plating margin;
 - the current sensor must be zero-calibrated to within C/100 (0.05 A for the example cell). This is a **safety requirement** in the under-reading direction: the limits budget exactly that offset, so a sensor that reads low by more hides current the limits do not cover. An over-reading offset fails safe (over-current or plausibility faults; up to C/100 is tolerated). A production BMS should cross-check the charger's own current measurement.
+
+The tracking and divergence checks also allow for the fitted OCV table being imperfect: in the self-test a healthy cell whose OCV differs from the table by a sinusoidal error (10 mV over 0.33 SOC, or 5 mV over 0.2 SOC) charges without a latched fault across the parameter-mismatch corners. Larger OCV-shape errors (for example 10 mV over 0.2 SOC with 15 % less capacity, 30 % more R0 and twice R1) can latch a false plausibility fault, so the OCV table must be fitted to that accuracy for the cell in use.
 
 `ev_step_with_pack_voltage()` closes the first three (the frozen-taper case peaks at about 97 %): in the self-test it detects the 30 mV offset at once and the drift at about 69 % SOC, with no false fault across the parameter-mismatch corners or with a 20 mΩ path between the cell taps and the pack sense point (pass that resistance in; the figures hold for a tolerance of 30 mV or less). An unavailable pack reading (for example a charger output that is not live yet) is skipped at rest; if it goes missing while current flows, the charge stays blocked until a valid reading is seen at rest. A production BMS should provide that redundant measurement.
 

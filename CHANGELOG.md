@@ -18,7 +18,7 @@ Reworked from the earlier firmware prototype into a validated charge limiter.
 - **Breaking:** `EvCellState` starts with `layout_version` (`EV_STATE_LAYOUT_VERSION` 4); a restored state with another version faults until `ev_cell_init()`. Flag bytes other than 0 or 1 are a state fault and read as set.
 - **Breaking:** `EvCellConfig` has a new `max_charge_current_A` field (the cell maker's limit, `EV_CONSTRAINT_CURRENT_LIMIT`); a configuration without it is invalid.
 - The graphite exchange-current and solid-diffusion activation energies are worst-case bounds (60 kJ/mol below 25 °C; 35 and 17 kJ/mol above), so cold charging is slower and the plating margin holds over the published range. Resistances use the same 2 °C cold sensor margin as the electrochemistry.
-- The PyBaMM reference also sweeps the exchange-current activation energy (35 / 53.4 / 60 kJ/mol), runs a 0 °C cell whose sensor reads 2 °C warm with a charger just inside (current sensor reading C/100 low) and outside its tolerance, and runs O'Regan2022's graphite diffusivity and exchange current for the same cell. Its plating floor is the controller's 5 mV margin, sampled at every point and time step.
+- The PyBaMM reference also sweeps the exchange-current activation energy (35 / 53.4 / 60 kJ/mol), runs a 0 °C cell whose sensor reads 2 °C warm with a charger just inside (current sensor reading C/100 low), outside, and at the highest current that never faults, and runs O'Regan2022's graphite diffusivity and exchange current for the same cell, cold and warm. Its plating floor is the controller's 5 mV margin, sampled at every point and time step.
 - The PyBaMM DFN reference uses activation energies independent of the controller (a 2 × 2 sweep at 2 and 10 °C), and adds a lumped-thermal run, a cold constant-voltage taper run and a terminal-voltage check.
 - Documentation: sensor limits of a single voltage channel per cell with the bound the self-test measures for each, the ageing assumption and its limits, and the assumptions behind the quoted C-rates.
 
@@ -40,6 +40,8 @@ Reworked from the earlier firmware prototype into a validated charge limiter.
 - An invalid voltage sample no longer restarts the tracking window or clears a suspicion; an intermittent voltage reading is a latched sensor fault, and while a reading is suspect the SOC sigma grows with the charge counted.
 - A pack reading that goes missing during a charge keeps the charge blocked until it is valid at rest, instead of letting it duty-cycle; plain `ev_step()` reports the block too.
 - A reading that stays suspect while 10 % of the capacity is charged latches the plausibility fault, so charge pauses caused by invalid samples cannot keep resetting the confirmation timer.
+- The gradient memory is driven by the measured current plus the C/100 sensor offset, as the limits are, and every check spans at least dt plus the 2 s charger ramp-down.
+- `ev_clear_latched_faults()` documents everything it clears (intermittent-sensor latch, pack block, over-charge integral).
 - An estimator reset repairs every validated field (pack-mismatch timer, intermittency score, hold counter), so one corrupted field no longer faults forever.
 - No credit for Joule self-heating in the electrochemistry and 0 °C checks, so every constraint is monotone in current.
 - Concentration overpotential uses the measured LiPF6 diffusion-potential factor bound (1.85, Landesfeind & Gasteiger 2019) instead of the ideal-solution 0.74.

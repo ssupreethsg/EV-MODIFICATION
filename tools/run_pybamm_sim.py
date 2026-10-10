@@ -27,15 +27,18 @@ Every sample convention follows ev_step(): current_A[i] is the current over (t[i
    limiter must still charge) are evaluated on the nominal case (17 / 35 kJ/mol). Extra cases: 2 degC
    from 75 % SOC on the harshest corner including i0 60 kJ/mol (exercises the cold CV taper); a
    lumped-thermal DFN at 25 degC with the controller fed the DFN cell temperature (max <= 45 degC);
-   O'Regan2022's graphite diffusivity and exchange current (fitted together on the same cell) at 10
-   and 25 degC. The isothermal cases cannot show self-heating; only the lumped case does.
+   O'Regan2022's graphite diffusivity and exchange current (fitted together on the same cell, with
+   their own temperature dependence; electrolyte 30 kJ/mol) at 2 and 25 degC and in the 0 degC
+   sensor-bias case. The isothermal cases cannot show self-heating; only the lumped case does.
    Sensor errors at their limits, on the harsh corner with i0 60 kJ/mol: the DFN is at 0 degC while
    the controller reads 2 degC (EV_TEMPERATURE_SENSOR_MARGIN_C). (a) From 5 % SOC with an exact
    charger. (b) From 50 % SOC, the charger delivers 1.05 x command + 0.99 x C/50 (just inside the fast
    over-current tolerance) and the current sensor reads C/100 low: only the over-charge integral may
    fault, not before 1500 s. (c) The charger delivers 1.05 x command + 1.5 x C/50, outside the
-   tolerance: EV_FAULT_OVER_CURRENT (0x800) must appear within 30 s. Each must stay >= 5 mV, and (a)
-   and (b) must charge at least 5 % SOC, so they cannot pass by never charging. In every
+   tolerance: EV_FAULT_OVER_CURRENT (0x800) must appear within 30 s. (d) From 5 % and from 75 % SOC,
+   the charger delivers 1.05 x command + 1.99 x C/100 with the sensor C/100 low: the highest current
+   that never faults; no fault allowed. Each must stay >= 5 mV, and (a),
+   (b) and (d) must charge at least 5 % SOC, so they cannot pass by never charging. In every
    case a charger obeys a stop: when the controller approves 0 A (end of charge or a fault) the
    plant delivers 0 A, and the run ends.
 
@@ -614,10 +617,33 @@ def main():
                 temperature_bias_C=DFN_SENSOR_BIAS_C,
                 min_charge=DFN_BIAS_MIN_CHARGE if allow else 0.0,
             )
-        # An independent graphite transport/kinetics pair for the same cell (O'Regan et al. 2022).
-        for temperature_C in (10.0, 25.0):
+        # The highest charger current that never faults: the integral counts only measured charge above
+        # 1.05 x command + C/100, so a charger at 1.05 x command + 1.99 x C/100 with the sensor reading
+        # C/100 low runs indefinitely. From low SOC (kinetics) and from 75 % SOC (CV taper).
+        for start_soc in (DFN_START_SOC, DFN_COLD_CV_START_SOC):
             run_case(
-                f"{temperature_C:.0f} degC O'Regan2022 graphite D_s and i0", temperature_C, None, oregan_anode=True
+                f"0 degC ({bias}) from SOC {start_soc:.2f} {harsh} i0={i0_worst / 1000:g} kJ/mol, "
+                f"sustained charger excess {1.0 + DFN_EDGE_FRACTION:g} x C/100, sensor {sensor_A:.3f} A low",
+                0.0,
+                DFN_HARSH_EA_J_MOL,
+                start_soc=start_soc,
+                i0_activation_J_mol=i0_worst,
+                charger_offset_A=(1.0 + DFN_EDGE_FRACTION) * sensor_A,
+                sensor_offset_A=sensor_A,
+                temperature_bias_C=DFN_SENSOR_BIAS_C,
+                min_charge=DFN_BIAS_MIN_CHARGE,
+            )
+        # An independent graphite transport/kinetics pair for the same cell (O'Regan et al. 2022), with
+        # its own temperature dependence; the electrolyte uses the harsh 30 kJ/mol. Cold, where its
+        # diffusivity is lowest, including the sensor-bias case.
+        for temperature_C, bias_C in ((2.0, 0.0), (0.0, DFN_SENSOR_BIAS_C), (25.0, 0.0)):
+            run_case(
+                f"{temperature_C:.0f} degC{f' ({bias})' if bias_C else ''} O'Regan2022 graphite D_s and i0, Ee=30",
+                temperature_C,
+                DFN_HARSH_EA_J_MOL,
+                oregan_anode=True,
+                temperature_bias_C=bias_C,
+                min_charge=DFN_BIAS_MIN_CHARGE,
             )
         thermal = run_case("25 degC lumped-thermal", 25.0, DFN_NOMINAL_EA_J_MOL, thermal=True)
         checks.append(
@@ -636,7 +662,11 @@ def main():
     for name, value, limit in checks:
         passed = value <= limit
         ok = ok and passed
-        shown = -value if (name.startswith("DFN") and ("anode potential" in name or "final SOC" in name)) else value
+        shown = (
+            -value
+            if (name.startswith("DFN") and ("anode potential" in name or "final SOC" in name or "SOC charged" in name))
+            else value
+        )
         print(f"{'PASS' if passed else 'FAIL'}: {name} = {shown:.4f}")
 
     plot(args.out, val, rc_voltage_V, rc_rms, nominal[0], nominal[1], dfn_traces)
