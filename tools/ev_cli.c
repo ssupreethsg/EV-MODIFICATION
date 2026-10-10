@@ -15,7 +15,8 @@
  *       stdout: "<soc> <soc_sigma> <rc_voltage_V> <decision>" per line, running ev_step() on a
  *               pack of identical cells with a 0 A request and a 30 s horizon
  *
- * Exits 2 on a usage error and 3 on malformed or out-of-range input (with a message on stderr).
+ * Exits 2 on a usage error and 3 on malformed, out-of-range or overlong (> EV_CLI_LINE_LENGTH - 2
+ * characters) input lines (with a message on stderr).
  */
 #include <errno.h>
 #include <math.h>
@@ -47,10 +48,23 @@ static int ev_parse_numbers(const char *text, double *values, int count) {
     return (*cursor == '\0') ? 0 : -1;
 }
 
+/* Reads one line: 1 = line read, 0 = end of input, -1 = line too long for the buffer (reported). */
+static int ev_read_line(char *line, int size, unsigned long line_number) {
+    if (fgets(line, size, stdin) == NULL) {
+        return 0;
+    }
+    if ((strchr(line, '\n') == NULL) && (fgetc(stdin) != EOF)) {
+        fprintf(stderr, "line %lu: longer than %d characters\n", line_number, size - 2);
+        return -1;
+    }
+    return 1;
+}
+
 static int ev_run_ocv(void) {
     char line[EV_CLI_LINE_LENGTH];
     unsigned long line_number = 0UL;
-    while (fgets(line, (int)sizeof(line), stdin) != NULL) {
+    int status;
+    while ((status = ev_read_line(line, (int)sizeof(line), line_number + 1UL)) > 0) {
         double soc;
         float ocv = 0.0f;
         float slope = 0.0f;
@@ -63,7 +77,7 @@ static int ev_run_ocv(void) {
         printf("%.6f %.6f\n", (double)ocv, (double)slope);
         fflush(stdout);
     }
-    return 0;
+    return (status < 0) ? 3 : 0;
 }
 
 /* Parses the five cell parameters shared by the limit and ekf modes. */
@@ -105,7 +119,7 @@ static int ev_run_limit(char *argv[]) {
     if (status != 0) {
         return status;
     }
-    while (fgets(line, (int)sizeof(line), stdin) != NULL) {
+    while ((status = ev_read_line(line, (int)sizeof(line), line_number + 1UL)) > 0) {
         double f[EV_CLI_MAX_FIELDS];
         EvCellState state;
         EvCellPrediction prediction;
@@ -113,7 +127,8 @@ static int ev_run_limit(char *argv[]) {
         float approved_A;
         ++line_number;
         if ((ev_parse_numbers(line, f, 7) != 0) || (f[0] < 0.0) || (f[0] > 1.0) || (f[1] < 0.0) || (f[1] > 0.5)
-            || (f[4] < EV_MIN_SOH) || (f[4] > 1.0) || (f[5] < 0.0) || (f[6] <= 0.0)) {
+            || (f[2] < (double)EV_MIN_PLAUSIBLE_TEMPERATURE_C) || (f[2] > (double)EV_MAX_PLAUSIBLE_TEMPERATURE_C)
+            || (f[3] < -1.0) || (f[3] > 1.0) || (f[4] < EV_MIN_SOH) || (f[4] > 1.0) || (f[5] < 0.0) || (f[6] <= 0.0)) {
             fprintf(stderr, "line %lu: expected '<soc> <soc_sigma> <temperature_C> <rc_voltage_V> <soh> <request_A> <horizon_s>'\n", line_number);
             return 3;
         }
@@ -126,7 +141,7 @@ static int ev_run_limit(char *argv[]) {
                (double)prediction.terminal_voltage_V, (double)prediction.predicted_temperature_C, (unsigned)constraints);
         fflush(stdout);
     }
-    return 0;
+    return (status < 0) ? 3 : 0;
 }
 
 static int ev_run_ekf(char *argv[]) {
@@ -137,20 +152,26 @@ static int ev_run_ekf(char *argv[]) {
     char line[EV_CLI_LINE_LENGTH];
     unsigned long line_number = 0UL;
     unsigned int i;
+    int status;
 
     if ((ev_parse_numbers(argv[4], &initial_soc, 1) != 0) || (ev_parse_numbers(argv[5], &initial_temperature_C, 1) != 0)) {
         fprintf(stderr, "initial SOC and temperature must be finite numbers\n");
         return 2;
     }
+    if ((initial_soc < 0.0) || (initial_soc > 1.0) || (initial_temperature_C < (double)EV_MIN_PLAUSIBLE_TEMPERATURE_C)
+        || (initial_temperature_C > (double)EV_MAX_PLAUSIBLE_TEMPERATURE_C)) {
+        fprintf(stderr, "initial SOC must be in [0, 1] and the initial temperature plausible\n");
+        return 2;
+    }
     for (i = 0U; i < EV_NUM_CELLS; ++i) {
-        int status = ev_parse_config(argv, (float)initial_temperature_C, &config[i]);
+        status = ev_parse_config(argv, (float)initial_temperature_C, &config[i]);
         if (status != 0) {
             return status;
         }
         ev_cell_init(&state[i], initial_soc, (float)initial_temperature_C);
     }
 
-    while (fgets(line, (int)sizeof(line), stdin) != NULL) {
+    while ((status = ev_read_line(line, (int)sizeof(line), line_number + 1UL)) > 0) {
         double fields[EV_CLI_MAX_FIELDS];
         float voltages_V[EV_NUM_CELLS];
         float temperatures_C[EV_NUM_CELLS];
@@ -163,13 +184,16 @@ static int ev_run_ekf(char *argv[]) {
         for (i = 0U; i < EV_NUM_CELLS; ++i) {
             voltages_V[i] = (float)fields[2];
             temperatures_C[i] = (float)fields[3];
+            /* the estimator replay has no charger to supervise */
+            state[i].commanded_current_A = EV_MAX_PLAUSIBLE_CURRENT_A;
+            state[i].ramp_from_A = EV_MAX_PLAUSIBLE_CURRENT_A;
         }
         result = ev_step(config, state, (float)fields[1], 0.0f, voltages_V, temperatures_C, (float)fields[0], 30.0f);
         printf("%.6f %.6f %.6f %u\n", state[0].soc, sqrt(state[0].covariance[0]), (double)state[0].rc_voltage_V,
                (unsigned)result.decision);
         fflush(stdout);
     }
-    return 0;
+    return (status < 0) ? 3 : 0;
 }
 
 int main(int argc, char *argv[]) {

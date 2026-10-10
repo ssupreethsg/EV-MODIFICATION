@@ -6,6 +6,7 @@ include(GNUInstallDirs)
 option(EV_BUILD_TESTS "Build the self-test, the CLI bridge and register the tests" ${PROJECT_IS_TOP_LEVEL})
 option(EV_WARNINGS_AS_ERRORS "Treat compiler warnings as errors (CI turns this on)" OFF)
 option(EV_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer (GCC/Clang)" OFF)
+option(EV_INSTALL "Generate the install and package rules" ${PROJECT_IS_TOP_LEVEL})
 option(EV_PYTHON_TESTS "Register the Python checks with CTest (need numpy and scipy)" ON)
 
 if(PROJECT_IS_TOP_LEVEL)
@@ -42,7 +43,7 @@ target_include_directories(ev_modify PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_compile_options(ev_modify PRIVATE ${EV_WARNING_FLAGS} ${EV_SANITIZER_FLAGS})
-target_link_options(ev_modify INTERFACE ${EV_SANITIZER_FLAGS})
+target_link_options(ev_modify INTERFACE "$<BUILD_INTERFACE:${EV_SANITIZER_FLAGS}>")
 if(NOT MSVC)
     target_link_libraries(ev_modify PUBLIC m)
 endif()
@@ -88,19 +89,21 @@ if(EV_BUILD_TESTS)
 endif()
 
 # ---- Install / package --------------------------------------------------------------------
-include(CMakePackageConfigHelpers)
-install(TARGETS ev_modify EXPORT ev_modifyTargets
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(FILES src/spme_v7_apex_solver.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(EXPORT ev_modifyTargets NAMESPACE ev_modify:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ev_modify)
-file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/ev_modifyConfig.cmake.in
-     "@PACKAGE_INIT@\ninclude(\"\${CMAKE_CURRENT_LIST_DIR}/ev_modifyTargets.cmake\")\ncheck_required_components(ev_modify)\n")
-configure_package_config_file(${CMAKE_CURRENT_BINARY_DIR}/ev_modifyConfig.cmake.in
-                              ${CMAKE_CURRENT_BINARY_DIR}/ev_modifyConfig.cmake
-                              INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ev_modify)
-write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/ev_modifyConfigVersion.cmake
-                                 COMPATIBILITY SameMajorVersion)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ev_modifyConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/ev_modifyConfigVersion.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ev_modify)
-install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
+if(EV_INSTALL)
+    include(CMakePackageConfigHelpers)
+    install(TARGETS ev_modify EXPORT ev_modifyTargets
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(FILES src/spme_v7_apex_solver.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(EXPORT ev_modifyTargets NAMESPACE ev_modify:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ev_modify)
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/ev_modifyConfig.cmake.in
+         "@PACKAGE_INIT@\ninclude(\"\${CMAKE_CURRENT_LIST_DIR}/ev_modifyTargets.cmake\")\ncheck_required_components(ev_modify)\n")
+    configure_package_config_file(${CMAKE_CURRENT_BINARY_DIR}/ev_modifyConfig.cmake.in
+                                  ${CMAKE_CURRENT_BINARY_DIR}/ev_modifyConfig.cmake
+                                  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ev_modify)
+    write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/ev_modifyConfigVersion.cmake
+                                     COMPATIBILITY SameMajorVersion)
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ev_modifyConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/ev_modifyConfigVersion.cmake
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ev_modify)
+    install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
+endif()

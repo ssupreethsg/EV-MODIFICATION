@@ -49,6 +49,24 @@ extern "C" {
 #define EV_SOC_SIGMA_MULTIPLIER 3.0          /* SOC constraints use soc + k * sigma */
 #define EV_INNOVATION_GATE_SIGMA 5.0         /* EKF rejects voltage innovations beyond this */
 #define EV_INNOVATION_FAULT_CYCLES 10U       /* consecutive rejections => voltage plausibility fault */
+/* Voltage tracking (frozen or stuck sensor, open wire): over a window the change of the reading
+ * must match the change of an open-loop model (coulomb counting + 1-RC + R0, started from the EKF
+ * state at the window start), after allowing for 30 % R0, 100 % R1 and 20 % OCV-change errors and
+ * for the OCV slope anywhere within the EKF's 3-sigma SOC band. Noise on a stuck
+ * reading does not help it pass: the test compares changes, not equality. */
+#define EV_TRACK_SUSPECT_V 0.010f            /* mismatch above this: the EKF ignores the reading until the window validates */
+#define EV_TRACK_FAULT_V 0.020f              /* mismatch above this ... */
+#define EV_TRACK_FAULT_CYCLES 3U             /* ... for this many consecutive cycles => plausibility fault */
+#define EV_TRACK_VALIDATE_V 0.030f           /* window validated (and restarted) once the reading has moved this much beyond the tolerance, as modelled */
+#define EV_TRACK_SPIKE_V 0.050f              /* consecutive readings further apart than this are not used to (re)start a window */
+#define EV_TRACK_R1_UNCERTAINTY 1.0f        /* relative R1 error allowed for (R1 and tau are least certain) */
+#define EV_TRACK_CAPACITY_UNCERTAINTY 0.2f   /* relative error of the open-loop OCV change (capacity, OCV slope) */
+#define EV_TRACK_REST_C_RATE 0.02f           /* below this |current| / capacity [1/h] the cell counts as at rest */
+/* Measured charge current must follow the approved command (charger ignoring the limit). */
+#define EV_OVER_CURRENT_TOLERANCE_A 0.5f     /* allowed excess over the approved current ... */
+#define EV_OVER_CURRENT_TOLERANCE_REL 0.05f  /* ... plus this fraction of it */
+#define EV_OVER_CURRENT_RAMP_S 2.0f          /* after a lower command the charger may ramp down linearly over this time */
+#define EV_OVER_CURRENT_CONFIRM_S 1.0f       /* excess sustained this long (in seconds, not cycles) => fault */
 #define EV_CURRENT_TOLERANCE_A 1.0e-3f
 
 /* ---- Input plausibility (outside => FAULT) ----------------------------------------------- */
@@ -84,6 +102,12 @@ extern "C" {
 #define EV_ELECTROLYTE_POROSITY 0.25f
 #define EV_BRUGGEMAN_EXPONENT 1.5f
 #define EV_TRANSFERENCE_NUMBER 0.2594f
+/* Diffusion-potential factor (1 - t+) * (1 + dln f/dln c) of the concentration overpotential.
+ * Chen2020/Nyman2008 assume an ideal solution (thermodynamic factor 1, product 0.74), but
+ * measured LiPF6 in EC:EMC 3:7 (Landesfeind & Gasteiger 2019, J. Electrochem. Soc. 166 A3079)
+ * gives 1.58-1.82 at 1 mol/L between -10 and 45 degC and less at lower concentration. The
+ * upper bound is used, so the term is never smaller than the measured electrolyte's. */
+#define EV_DIFFUSION_POTENTIAL_FACTOR 1.85f
 #define EV_ELECTROLYTE_CONDUCTIVITY_S_M 0.9487f
 #define EV_ELECTROLYTE_DIFFUSIVITY_M2_S 1.769e-10f
 /* Nyman2008 has no temperature dependence; 17 kJ/mol as in PyBaMM OKane2022 (Ecker2015) */
@@ -97,7 +121,15 @@ extern "C" {
 #define EV_CELL_MASS_KG 0.069f
 #define EV_CELL_COOLING_AREA_M2 0.00531f
 
-/* Ageing: linear placeholder rates of typical NMC/graphite magnitude at 25 degC (about 2 %
+/* Ageing: capacity fade raises the anode interfacial current density by 1/SOH (as if it were all
+ * loss of anode active material) while the fresh SOC -> stoichiometry mapping is kept. That is
+ * exact only for anode material lost fully lithiated, and conservative for loss of lithium
+ * inventory (the usual dominant mode: anode potential +2 to +11 mV at 5-20 % LLI, Chen2020).
+ * Anode material lost partly lithiated raises the anode stoichiometry instead: 10 % lost at
+ * theta = 0.7 / 0.5 / 0.3 (SOH 0.93 / 0.95 / 0.97) puts the anode 11 / 20 / 38 mV below this
+ * model at 1C, and SOH alone cannot bound it. Use with aged cells requires the degradation
+ * modes from dV/dQ or three-electrode diagnostics.
+ * Linear placeholder rates of typical NMC/graphite magnitude at 25 degC (about 2 %
  * capacity per year calendar, 20 % after 1000 full equivalent cycles), Arrhenius scaled.
  * They must be replaced by cell-specific ageing data before use. */
 #define EV_CALENDAR_LOSS_PER_S 6.3e-10
@@ -131,6 +163,20 @@ typedef struct {
     float last_voltage_V;          /* latest plausible measured terminal voltage (0 = none yet) */
     float last_current_A;          /* current of the latest cycle */
     uint16_t innovation_fail_cycles; /* consecutive EKF innovations outside the gate */
+    float track_start_V;           /* reading at the start of the voltage-tracking window (0 = none) */
+    float track_start_model_V;     /* open-loop model voltage at the start of the window */
+    float track_start_ocv_V;       /* OCV at the start of the window */
+    double track_start_soc;        /* EKF SOC at the start of the window */
+    float track_rc_voltage_V;      /* open-loop polarisation voltage since the start of the window */
+    double track_soc;              /* open-loop (coulomb-counted) SOC since the start of the window */
+    float track_start_current_A;   /* current at the start of the window */
+    float track_max_current_step_A; /* largest |current - start current| in the window */
+    uint16_t track_fail_cycles;    /* consecutive cycles with a mismatch above EV_TRACK_FAULT_V */
+    bool track_suspect;            /* mismatch above EV_TRACK_SUSPECT_V in this window: EKF ignores the reading */
+    float commanded_current_A;     /* approved current of the previous ev_step() (0 after a FAULT) */
+    float ramp_from_A;             /* level the charger may still be ramping down from */
+    float ramp_age_s;              /* time since that ramp started */
+    float over_current_time_s;     /* time the measured current has exceeded the allowance */
     uint16_t fault_hold_cycles;    /* > 0 while a fault is being held */
     uint16_t fault_flags;          /* EV_FAULT_* bits seen on the latest cycle */
     bool cold_charge_block;        /* below 0 degC (with margin); released 3 degC above */
@@ -157,6 +203,7 @@ typedef struct {
 #define EV_FAULT_OVER_VOLTAGE 0x100U  /* measured cell voltage above 4.2 V + margin */
 #define EV_FAULT_VOLTAGE_PLAUSIBILITY 0x200U /* voltage inconsistent with the model (e.g. stuck sensor) */
 #define EV_FAULT_END_OF_LIFE 0x400U   /* SOH reached EV_MIN_SOH: model no longer valid */
+#define EV_FAULT_OVER_CURRENT 0x800U  /* measured charge current above the approved command */
 
 typedef uint8_t EvDecision;
 #define EV_DECISION_ALLOW 0U          /* full request approved */
@@ -200,7 +247,8 @@ bool ev_config_is_valid(const EvCellConfig *config);
 
 /*
  * One control cycle:
- *  1. validate inputs; measured current and dt describe the interval that just elapsed;
+ *  1. validate inputs; measured current and dt describe the interval that just elapsed, during
+ *     which the previous call's approved current was in force (more than that => over-current);
  *  2. update every cell estimate (EKF, temperature, ageing) with those measurements;
  *  3. apply fault detection with hysteresis and hold;
  *  4. return the largest charge current <= request that keeps every cell inside all

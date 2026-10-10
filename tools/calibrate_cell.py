@@ -43,7 +43,8 @@ def resistance_scale(temperature_C):
 def simulate_cell(params, time_s, current_A, initial_soc, initial_temp_C, ambient_C, capacity_Ah):
     """Same discrete equations as the C model (current_A[i] held over (t[i-1], t[i]]): coulomb
     counting, exact lumped-thermal and 1-RC updates, V = OCV(soc) + v_rc + R0(T)*I with R0 and R1
-    referred to 25 degC."""
+    referred to 25 degC. R0 uses the previous sample's temperature (the C EKF updates the state
+    temperature after the estimator)."""
     h, cp, r0, r1, tau = params
     conductance_W_K = h * EV_CELL_COOLING_AREA_M2
     heat_capacity_J_K = EV_CELL_MASS_KG * cp
@@ -62,7 +63,7 @@ def simulate_cell(params, time_s, current_A, initial_soc, initial_temp_C, ambien
         rise = current * current * (r0 + r1) * scale / conductance_W_K
         decay = np.exp(-conductance_W_K * dt / heat_capacity_J_K)
         temp[i] = ambient_C + rise + (temp[i - 1] - ambient_C - rise) * decay
-    voltage = m.full_cell_ocv_V(soc) + v_rc + r0 * resistance_scale(temp) * current_A
+    voltage = m.full_cell_ocv_V(soc) + v_rc + r0 * resistance_scale(np.r_[temp[0], temp[:-1]]) * current_A
     return temp, voltage
 
 
@@ -88,7 +89,7 @@ def integrate_cell_ode(params, time_s, current_A, initial_soc, initial_temp_C, a
         v_rc.append(state[1])
         temp.append(state[2])
     temp = np.array(temp)
-    voltage = m.full_cell_ocv_V(np.array(soc)) + np.array(v_rc) + r0 * resistance_scale(temp) * current_A
+    voltage = m.full_cell_ocv_V(np.array(soc)) + np.array(v_rc) + r0 * resistance_scale(np.r_[temp[0], temp[:-1]]) * current_A
     return temp, voltage
 
 
@@ -160,8 +161,10 @@ def main():
     args = parser.parse_args()
     if args.self_test == (args.csv is not None):
         parser.error("give either a CSV file or --self-test")
-    if not args.capacity > 0.0:
-        parser.error("--capacity must be positive")
+    if not (np.isfinite(args.capacity) and args.capacity > 0.0):
+        parser.error("--capacity must be finite and positive")
+    if args.ambient is not None and not np.isfinite(args.ambient):
+        parser.error("--ambient must be finite")
 
     truth = None
     if args.self_test:

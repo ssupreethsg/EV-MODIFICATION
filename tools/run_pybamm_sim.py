@@ -11,7 +11,10 @@ Every sample convention follows ev_step(): current_A[i] is the current over (t[i
    1 % of samples outside; the controller's SOC limit relies on that band).
 4. Plating: closed loop between the C limiter (ev_cli limit, 3C request, 30 s horizon) and a PyBaMM
    DFN with Arrhenius electrolyte and diffusion terms, isothermal at 2, 10 and 25 degC, from 5 % SOC.
-   The DFN anode potential vs Li/Li+ (phi_s - phi_e) must stay >= 0 V everywhere in the electrode.
+   The DFN anode potential vs Li/Li+ (phi_s - phi_e) must stay >= 0 V everywhere in the electrode, and
+   the limiter must still charge (minimum final SOC per temperature). The loop drives
+   ev_cell_max_charge_current with the true SOC (sigma 0, rc 0): it validates the limiter's plating
+   predictor, not the estimator.
 
 Usage: python tools/run_pybamm_sim.py [--cli PATH] [--out PNG] [--skip-dfn]
 """
@@ -31,7 +34,6 @@ from scipy.optimize import least_squares  # noqa: E402
 import ev_model as m  # noqa: E402
 
 FARADAY = 96485.33212
-GAS_CONSTANT = 8.314462618
 INITIAL_SOC = 0.1
 TEMPERATURE_C = 25.0
 EKF_INITIAL_SOC_ERROR = 0.2
@@ -41,6 +43,7 @@ RC_FIT_RMS_TOLERANCE_V = 0.025
 EKF_SOC_TOLERANCE = 0.03
 EKF_MAX_FRACTION_OUTSIDE_3SIGMA = 0.01
 DFN_TEMPERATURES_C = (2.0, 10.0, 25.0)
+DFN_MIN_FINAL_SOC = {2.0: 0.65, 10.0: 0.80, 25.0: 0.85}   # the limiter must keep charging, not just stay safe
 DFN_START_SOC = 0.05
 DFN_STEP_S = 10.0
 DFN_MAX_TIME_S = 2.0 * 3600.0
@@ -57,7 +60,7 @@ def chen2020(temperature_C=TEMPERATURE_C, arrhenius=False):
             raise RuntimeError(f"PyBaMM stoichiometry {name} = {value:.6f} differs from the C header ({header:.6f})")
     if arrhenius:
         def factor(activation_energy, temperature):
-            return pybamm.exp(activation_energy / GAS_CONSTANT * (1.0 / 298.15 - 1.0 / temperature))
+            return pybamm.exp(activation_energy / m.header_constant("EV_GAS_J_PER_MOL_K") * (1.0 / 298.15 - 1.0 / temperature))
         kappa = parameter_values["Electrolyte conductivity [S.m-1]"]
         diffusivity = parameter_values["Electrolyte diffusivity [m2.s-1]"]
         solid_diffusivity = parameter_values["Negative particle diffusivity [m2.s-1]"]
@@ -236,9 +239,13 @@ def main():
             min_potential, trace = dfn_closed_loop(cli, temperature_C, params)
             dfn_traces.append((temperature_C, trace))
             final_soc = trace[-1, 1] if trace.size else DFN_START_SOC
+            if not trace.size:
+                min_potential = -np.inf   # the limiter never charged: no plating evidence at all
             print(f"DFN {temperature_C:.0f} degC: charged {DFN_START_SOC:.2f} -> {final_soc:.3f} SOC in {trace.shape[0] * DFN_STEP_S / 60:.0f} min")
             checks.append((f"DFN {temperature_C:.0f} degC min anode potential (>= {PLATING_ONSET_V} V) [V]",
                            -min_potential, -PLATING_ONSET_V))
+            checks.append((f"DFN {temperature_C:.0f} degC final SOC (>= {DFN_MIN_FINAL_SOC[temperature_C]})",
+                           -final_soc, -DFN_MIN_FINAL_SOC[temperature_C]))
 
     print(f"SOC window capacity {capacity_Ah:.4f} Ah; fitted 1-RC: R0 = {params[0] * 1000:.2f} mOhm, "
           f"R1 = {params[1] * 1000:.2f} mOhm, tau = {params[2]:.1f} s")

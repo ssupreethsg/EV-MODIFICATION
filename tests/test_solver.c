@@ -51,6 +51,10 @@ typedef struct {
     double true_soc[EV_NUM_CELLS];
     double true_rc_V[EV_NUM_CELLS];
     float plant_r0_scale;            /* plant R0 = scale * configured R0 */
+    float plant_r1_scale;            /* plant R1 = scale * configured R1 */
+    float plant_tau_scale;           /* plant tau = scale * configured tau */
+    float plant_capacity_scale;      /* plant capacity = scale * configured capacity */
+    float adc_lsb_V;                 /* voltage quantisation (0 = none) */
     float voltages_V[EV_NUM_CELLS];
     float temperatures_C[EV_NUM_CELLS];
 } Pack;
@@ -59,6 +63,9 @@ static void pack_init(Pack *pack, const double soc[EV_NUM_CELLS], const float te
     uint8_t i;
     memset(pack, 0, sizeof(*pack));
     pack->plant_r0_scale = 1.0f;
+    pack->plant_r1_scale = 1.0f;
+    pack->plant_tau_scale = 1.0f;
+    pack->plant_capacity_scale = 1.0f;
     for (i = 0U; i < EV_NUM_CELLS; ++i) {
         pack->config[i] = lgm50_config();
         ev_cell_init(&pack->state[i], soc[i], temperature_C[i]);
@@ -79,17 +86,29 @@ static void pack_uniform(Pack *pack, double soc, float temperature_C) {
     pack_init(pack, socs, temps);
 }
 
+/* Resistance rise in the cold, as in the controller (Arrhenius, EV_RESISTANCE_ACTIVATION_ENERGY_J_MOL). */
+static double plant_resistance_scale(float temperature_C) {
+    return exp(((double)EV_RESISTANCE_ACTIVATION_ENERGY_J_MOL / (double)EV_GAS_J_PER_MOL_K)
+               * ((1.0 / ((double)temperature_C + (double)EV_KELVIN_OFFSET)) - (1.0 / (double)EV_REFERENCE_TEMPERATURE_K)));
+}
+
 /* Advances the plant by dt with the current applied over the last interval. */
 static void plant_step(Pack *pack, float current_A, float dt_s) {
     uint8_t i;
     for (i = 0U; i < EV_NUM_CELLS; ++i) {
         const EvCellConfig *c = &pack->config[i];
-        double a = exp(-(double)dt_s / (double)c->rc_time_constant_s);
+        double a = exp(-(double)dt_s / ((double)c->rc_time_constant_s * (double)pack->plant_tau_scale));
+        double scale = plant_resistance_scale(pack->temperatures_C[i]);
         float ocv = 0.0f;
-        pack->true_soc[i] += ((double)current_A * (double)dt_s) / ((double)c->nominal_capacity_Ah * pack->state[i].soh * 3600.0);
-        pack->true_rc_V[i] = (a * pack->true_rc_V[i]) + ((double)c->rc_resistance_ohm * (1.0 - a) * (double)current_A);
+        pack->true_soc[i] += ((double)current_A * (double)dt_s)
+            / ((double)c->nominal_capacity_Ah * (double)pack->plant_capacity_scale * pack->state[i].soh * 3600.0);
+        pack->true_rc_V[i] = (a * pack->true_rc_V[i])
+            + ((double)c->rc_resistance_ohm * (double)pack->plant_r1_scale * scale * (1.0 - a) * (double)current_A);
         ev_full_cell_ocv_V_and_dv_dsoc((float)pack->true_soc[i], &ocv, NULL);
-        pack->voltages_V[i] = ocv + (float)pack->true_rc_V[i] + (pack->plant_r0_scale * c->resistance_ohm * current_A);
+        pack->voltages_V[i] = ocv + (float)pack->true_rc_V[i] + (float)((double)pack->plant_r0_scale * (double)c->resistance_ohm * scale * (double)current_A);
+        if (pack->adc_lsb_V > 0.0f) {
+            pack->voltages_V[i] = roundf(pack->voltages_V[i] / pack->adc_lsb_V) * pack->adc_lsb_V;
+        }
     }
 }
 
@@ -481,6 +500,271 @@ static void test_stuck_voltage_sensor_is_detected(void) {
     check(result.decision == EV_DECISION_FAULT, "stuck sensor: fault stays latched while the sensor is stuck");
 }
 
+/* Round-3 finding: a sensor frozen at its own in-range reading during a charge used to drag the
+ * SOC estimate down with it (estimate 0.68 while the cell reached 0.96) and was never flagged. */
+static void test_frozen_in_range_sensor_is_detected(void) {
+    const double socs[EV_NUM_CELLS] = {0.30, 0.30, 0.40, 0.30};   /* cell 2 is the fullest: it limits the pack */
+    const float temps[EV_NUM_CELLS] = {25.0f, 25.0f, 25.0f, 25.0f};
+    Pack pack;
+    EvPackResult result;
+    float applied_A = 0.0f;
+    float frozen_V = 0.0f;
+    uint32_t detected_at = 0U;
+    uint32_t t;
+    pack_init(&pack, socs, temps);
+    for (t = 0U; t < 2U * 3600U; ++t) {
+        plant_step(&pack, applied_A, DT_S);
+        if (t == 300U) { frozen_V = pack.voltages_V[2]; }
+        if (t >= 300U) { pack.voltages_V[2] = frozen_V; }   /* frozen at the true value */
+        result = ev_step(pack.config, pack.state, applied_A, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+        if ((detected_at == 0U) && ((result.fault_flags & EV_FAULT_VOLTAGE_PLAUSIBILITY) != 0U)) { detected_at = t; }
+        applied_A = result.approved_charge_current_A;
+    }
+    check((detected_at > 300U) && (detected_at < 300U + 600U), "frozen sensor: flagged within 10 min of a 1C charge");
+    check(fabs(pack.state[2].soc - pack.true_soc[2]) < 0.01, "frozen sensor: SOC estimate not dragged by the frozen reading");
+    check(result.decision == EV_DECISION_FAULT, "frozen sensor: fault latched while the reading stays frozen");
+}
+
+static void test_frozen_sensor_detected_when_charge_starts(void) {
+    Pack pack;
+    EvPackResult result;
+    float frozen_V;
+    uint32_t cycle;
+    bool detected = false;
+    pack_uniform(&pack, 0.5, 25.0f);
+    plant_step(&pack, 0.0f, DT_S);
+    for (cycle = 0U; cycle < 3U; ++cycle) {   /* at rest: the tracking window starts */
+        result = ev_step(pack.config, pack.state, 0.0f, 0.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    }
+    result = ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    frozen_V = pack.voltages_V[1];
+    for (cycle = 0U; cycle < EV_TRACK_FAULT_CYCLES + 1U; ++cycle) {
+        float applied_A = result.approved_charge_current_A;
+        plant_step(&pack, applied_A, DT_S);
+        pack.voltages_V[1] = frozen_V;   /* no R0 step when the current starts */
+        result = ev_step(pack.config, pack.state, applied_A, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+        detected = detected || ((result.fault_flags & EV_FAULT_VOLTAGE_PLAUSIBILITY) != 0U);
+    }
+    check(detected, "frozen sensor: missing R0 step at charge start flagged within 4 cycles");
+}
+
+/* Round-4 finding: +/-1.5 mV of noise on a frozen reading restarted the old dead-band run every
+ * cycle; the cell reached 106 % SOC without a fault. */
+static void test_noisy_frozen_sensor_is_detected(void) {
+    const float amplitudes_mV[] = {1.5f, 5.0f, 15.0f};
+    size_t k;
+    for (k = 0U; k < sizeof(amplitudes_mV) / sizeof(amplitudes_mV[0]); ++k) {
+        const double socs[EV_NUM_CELLS] = {0.30, 0.30, 0.40, 0.30};
+        const float temps[EV_NUM_CELLS] = {25.0f, 25.0f, 25.0f, 25.0f};
+        Pack pack;
+        EvPackResult result;
+        float applied_A = 0.0f;
+        float frozen_V = 0.0f;
+        double max_true_soc = 0.0;
+        bool detected = false;
+        uint32_t t;
+        pack_init(&pack, socs, temps);
+        for (t = 0U; t < 4U * 3600U; ++t) {
+            plant_step(&pack, applied_A, DT_S);
+            if (t == 300U) { frozen_V = pack.voltages_V[2]; }
+            if (t >= 300U) {
+                pack.voltages_V[2] = frozen_V + ((((t & 1U) != 0U) ? 1.0f : -1.0f) * amplitudes_mV[k] * 1.0e-3f);
+            }
+            result = ev_step(pack.config, pack.state, applied_A, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+            detected = detected || ((result.fault_flags & EV_FAULT_VOLTAGE_PLAUSIBILITY) != 0U);
+            if (pack.true_soc[2] > max_true_soc) { max_true_soc = pack.true_soc[2]; }
+            applied_A = result.approved_charge_current_A;
+        }
+        check(detected, "noisy frozen sensor: plausibility fault raised");
+        check(max_true_soc < 0.55, "noisy frozen sensor: charging stops soon after the freeze");
+        check(fabs(pack.state[2].soc - pack.true_soc[2]) < 0.02, "noisy frozen sensor: SOC estimate not dragged");
+    }
+}
+
+/* Round-4 finding: the old fault cleared at rest, charging resumed in bursts and each rest pulled
+ * the SOC estimate back toward the frozen reading. */
+static void test_frozen_sensor_fault_stays_latched(void) {
+    Pack pack;
+    EvPackResult result;
+    float applied_A = 0.0f;
+    float frozen_V = 0.0f;
+    uint32_t toggles = 0U;
+    uint32_t t;
+    bool was_fault = false;
+    pack_uniform(&pack, 0.80, 25.0f);
+    for (t = 0U; t < 6U * 3600U; ++t) {
+        plant_step(&pack, applied_A, DT_S);
+        if (t == 10U) { frozen_V = pack.voltages_V[2]; }
+        if (t >= 10U) { pack.voltages_V[2] = frozen_V; }   /* frozen at its rested value */
+        result = ev_step(pack.config, pack.state, applied_A, (t >= 60U) ? 10.0f : 0.0f,
+                         pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+        if ((result.decision == EV_DECISION_FAULT) != was_fault) { ++toggles; }
+        was_fault = (result.decision == EV_DECISION_FAULT);
+        applied_A = result.approved_charge_current_A;
+    }
+    check(was_fault && (toggles <= 1U), "frozen sensor: fault latched, no charge bursts");
+    check(pack.true_soc[2] < 0.81, "frozen sensor: no blind charge after the fault");
+}
+
+/* Round-4 review: the tracking tolerance must cover realistic plant/model mismatch, including
+ * an unconverged EKF, or a healthy sensor is faulted (and the EKF stops learning). */
+static void test_tracking_tolerates_parameter_mismatch(void) {
+    /* capacity, R1, tau scale; initial SOC error */
+    const float cases[][4] = {
+        {0.85f, 1.0f, 1.0f, 0.0f}, {1.1f, 1.0f, 1.0f, 0.0f}, {1.0f, 2.0f, 1.0f, 0.0f}, {1.0f, 1.0f, 0.3f, 0.0f},
+        {1.0f, 1.0f, 3.0f, 0.0f}, {0.9f, 1.5f, 2.0f, 0.0f}, {1.0f, 0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 0.15f},
+    };
+    bool no_false_fault = true;
+    bool estimate_ok = true;
+    size_t k;
+    for (k = 0U; k < sizeof(cases) / sizeof(cases[0]); ++k) {
+        Pack pack;
+        EvPackResult result;
+        float applied_A = 0.0f;
+        uint32_t t;
+        uint8_t i;
+        pack_uniform(&pack, 0.2, 25.0f);
+        pack.plant_capacity_scale = cases[k][0];
+        pack.plant_r1_scale = cases[k][1];
+        pack.plant_tau_scale = cases[k][2];
+        pack.adc_lsb_V = 0.001f;
+        for (i = 0U; i < EV_NUM_CELLS; ++i) {
+            pack.state[i].soc = 0.2 + (double)cases[k][3];
+            if (cases[k][3] > 0.0f) { pack.state[i].covariance[0] = 0.04; }
+        }
+        for (t = 0U; t < 5U * 3600U; ++t) {
+            /* CC-CV charge to the limit; with an SOC error, 1C pulses and rests first so the EKF can learn */
+            float request_A = ((cases[k][3] > 0.0f) && (t < 3600U) && (((t / 600U) % 2U) == 1U)) ? 0.0f : 10.0f;
+            result = pack_step(&pack, applied_A, request_A);
+            no_false_fault = no_false_fault && ((result.fault_flags & EV_FAULT_VOLTAGE_PLAUSIBILITY) == 0U);
+            applied_A = result.approved_charge_current_A;
+        }
+        estimate_ok = estimate_ok && (fabs(pack.state[0].soc - pack.true_soc[0]) < 0.05);
+    }
+    check(no_false_fault, "tracking: no false fault with capacity/R1/tau mismatch, 1 mV ADC or an unconverged EKF");
+    check(estimate_ok, "tracking: EKF still learns SOC under those mismatches");
+}
+
+static void test_no_false_frozen_fault_with_mismatch(void) {
+    const float scales[] = {0.8f, 1.2f};
+    size_t k;
+    for (k = 0U; k < sizeof(scales) / sizeof(scales[0]); ++k) {
+        const double socs[EV_NUM_CELLS] = {0.20, 0.30, 0.25, 0.22};
+        const float temps[EV_NUM_CELLS] = {25.0f, 5.0f, 40.0f, 15.0f};
+        Pack pack;
+        EvPackResult result;
+        float applied_A = 0.0f;
+        uint16_t flags = 0U;
+        uint32_t t;
+        pack_init(&pack, socs, temps);
+        pack.plant_r0_scale = scales[k];
+        for (t = 0U; t < 5U * 3600U; ++t) {
+            result = pack_step(&pack, applied_A, 10.0f);
+            flags |= result.fault_flags;
+            applied_A = result.approved_charge_current_A;
+            if (applied_A < 0.05f) { break; }
+        }
+        check((flags & EV_FAULT_VOLTAGE_PLAUSIBILITY) == 0U, "frozen sensor: no false fault through CC-CV taper with +/-20 % R0 error");
+        check(pack.true_soc[1] > 0.85, "frozen sensor: pack still charges with R0 error");
+    }
+}
+
+/* Round-3 finding: Joule-heating credit let a larger current pass the 0 degC and plating checks
+ * that a smaller one failed, so the approved current fell as the request rose. */
+static void test_limit_monotone_in_request(void) {
+    /* soc, horizon_s, coolant degC, cell degC, heat transfer W/m2/K: cases that failed before */
+    const float cases[][5] = {
+        {0.05f, 10.0f, -7.5f, 11.5f, 1000.0f}, {0.05f, 30.0f, -30.0f, 2.5f, 10.0f}, {0.05f, 30.0f, -7.5f, 4.0f, 100.0f},
+        {0.60f, 120.0f, -22.5f, 34.0f, 100.0f}, {0.60f, 10.0f, 0.0f, 4.0f, 1000.0f}, {0.30f, 600.0f, -7.5f, 4.0f, 10.0f},
+    };
+    bool monotone = true;
+    bool interval = true;
+    size_t k;
+    for (k = 0U; k < sizeof(cases) / sizeof(cases[0]); ++k) {
+        EvCellConfig config = lgm50_config();
+        EvCellState state;
+        float previous_A = 0.0f;
+        float current_A;
+        bool was_safe = true;
+        config.coolant_temperature_C = cases[k][2];
+        config.heat_transfer_W_m2_K = cases[k][4];
+        ev_cell_init(&state, (double)cases[k][0], cases[k][3]);
+        state.covariance[0] = 1.0e-4;
+        for (current_A = 0.05f; current_A <= 40.0f; current_A += 0.05f) {
+            EvCellPrediction p;
+            float approved_A = ev_cell_max_charge_current(&config, &state, current_A, cases[k][1], NULL, NULL);
+            monotone = monotone && (approved_A >= previous_A - 1.0e-4f);
+            previous_A = approved_A;
+            (void)ev_predict_cell(&config, &state, current_A, cases[k][1], &p);
+            interval = interval && (was_safe || !p.safe);
+            was_safe = p.safe;
+        }
+    }
+    check(monotone, "search: approved current never falls when the request rises (cold coolant)");
+    check(interval, "physics: once unsafe, a larger current is never safe again");
+}
+
+/* Runs ev_step with a charger that slews toward the approved current at slew_A_s (or ignores it
+ * when slew_A_s < 0 and stays at stuck_A). Returns the union of fault flags. */
+static uint16_t run_charger(Pack *pack, float dt_s, float slew_A_s, float stuck_A, float request_A, float stop_at_s, float end_s) {
+    EvPackResult result;
+    float applied_A = 0.0f;
+    float command_A = 0.0f;
+    float t_s;
+    uint16_t flags = 0U;
+    for (t_s = 0.0f; t_s < end_s; t_s += dt_s) {
+        if (slew_A_s < 0.0f) {
+            applied_A = (t_s >= stop_at_s) ? stuck_A : command_A;
+        } else {
+            float step_A = slew_A_s * dt_s;
+            float target_A = command_A;
+            applied_A = (applied_A > target_A) ? fmaxf(applied_A - step_A, target_A) : fminf(applied_A + step_A, target_A);
+        }
+        plant_step(pack, applied_A, dt_s);
+        result = ev_step(pack->config, pack->state, applied_A, (t_s >= stop_at_s) ? 0.0f : request_A,
+                         pack->voltages_V, pack->temperatures_C, dt_s, HORIZON_S);
+        flags |= result.fault_flags;
+        command_A = result.approved_charge_current_A;
+    }
+    return flags;
+}
+
+/* Round-3 finding: nothing checked that the measured current follows the approved command.
+ * Round-4 finding: a lag counted in cycles tripped at short control periods. */
+static void test_over_current_fault(void) {
+    Pack pack;
+    EvPackResult result;
+    uint32_t cycle;
+    pack_uniform(&pack, 0.5, 25.0f);
+    check((run_charger(&pack, 0.1f, 5.0f, 0.0f, 3.0f, 60.0f, 70.0f) & EV_FAULT_OVER_CURRENT) == 0U,
+          "over-current: 5 A/s ramp-down after a stop at dt 0.1 s is tolerated");
+    pack_uniform(&pack, 0.5, 25.0f);
+    check((run_charger(&pack, 0.1f, 1.6f, 0.0f, 3.0f, 60.0f, 70.0f) & EV_FAULT_OVER_CURRENT) == 0U,
+          "over-current: 1.6 A/s ramp-down (1.9 s) at dt 0.1 s is tolerated");
+    pack_uniform(&pack, 0.5, 25.0f);
+    check((run_charger(&pack, 1.0f, 2.0f, 0.0f, 3.0f, 60.0f, 70.0f) & EV_FAULT_OVER_CURRENT) == 0U,
+          "over-current: 2 A/s ramp-down at dt 1 s is tolerated");
+    pack_uniform(&pack, 0.5, 25.0f);
+    check((run_charger(&pack, 0.1f, -1.0f, 3.0f, 3.0f, 60.0f, 70.0f) & EV_FAULT_OVER_CURRENT) != 0U,
+          "over-current: charger that keeps 3 A after a stop faults (dt 0.1 s)");
+    pack_uniform(&pack, 0.5, 25.0f);
+    check((run_charger(&pack, 10.0f, -1.0f, 3.0f, 3.0f, 60.0f, 100.0f) & EV_FAULT_OVER_CURRENT) != 0U,
+          "over-current: charger that keeps 3 A after a stop faults (dt 10 s)");
+
+    pack_uniform(&pack, 0.5, 25.0f);
+    result = pack_step(&pack, 0.0f, 2.0f);
+    check(result.approved_charge_current_A == 2.0f, "over-current: 2 A approved");
+    result = pack_step(&pack, (2.0f * 1.05f) + 0.4f, 2.0f);
+    check(result.decision != EV_DECISION_FAULT, "over-current: small excess tolerated");
+    result = pack_step(&pack, 6.0f, 2.0f);
+    check((result.decision == EV_DECISION_FAULT) && ((result.fault_flags & EV_FAULT_OVER_CURRENT) != 0U),
+          "over-current: charger ignoring the limit faults");
+    for (cycle = 0U; cycle < EV_FAULT_HOLD_CYCLES + 3U; ++cycle) {
+        result = pack_step(&pack, 0.0f, 2.0f);
+    }
+    check(result.decision != EV_DECISION_FAULT, "over-current: clears once the charger stops");
+}
+
 static void test_config_fault_marks_soc_stale(void) {
     Pack pack;
     pack_uniform(&pack, 0.5, 25.0f);
@@ -589,6 +873,46 @@ static void test_ageing_and_cold_reduce_the_limit(void) {
           && (constraints == EV_CONSTRAINT_INVALID_INPUT), "api: single-cell limit rejects invalid arguments");
 }
 
+/* Round-4 physics finding: steady gradients at the new, lower current overstated the anode
+ * potential right after a step-down. */
+static void test_gradients_remember_previous_current(void) {
+    EvCellConfig config = lgm50_config();
+    EvCellState fresh;
+    EvCellState after_step_down;
+    EvCellPrediction p_fresh;
+    EvCellPrediction p_after;
+    ev_cell_init(&fresh, 0.5, 5.0f);
+    ev_cell_init(&after_step_down, 0.5, 5.0f);
+    after_step_down.last_current_A = 6.0f;
+    (void)ev_predict_cell(&config, &fresh, 1.5f, HORIZON_S, &p_fresh);
+    (void)ev_predict_cell(&config, &after_step_down, 1.5f, HORIZON_S, &p_after);
+    check(p_after.anode_potential_V < p_fresh.anode_potential_V - 0.005f, "physics: gradients after a 6 A -> 1.5 A step use the 6 A history");
+    after_step_down.last_current_A = -6.0f;   /* discharge history adds nothing */
+    (void)ev_predict_cell(&config, &after_step_down, 1.5f, HORIZON_S, &p_after);
+    check(p_after.anode_potential_V == p_fresh.anode_potential_V, "physics: discharge history does not change the charge prediction");
+}
+
+/* Round-4 physics finding: at exactly 45 degC equilibrium the old thermal formula rounded above
+ * 45 degC at a small current and back to 45 degC at a larger one. */
+static void test_thermal_prediction_exact_at_equilibrium(void) {
+    EvCellConfig config = lgm50_config();
+    EvCellState state;
+    EvCellPrediction p;
+    float current_A;
+    float previous_C = -1.0e9f;
+    bool monotone = true;
+    config.coolant_temperature_C = 45.0f;
+    ev_cell_init(&state, 0.3, 45.0f);
+    (void)ev_predict_cell(&config, &state, 0.0f, HORIZON_S, &p);
+    check(p.predicted_temperature_C == 45.0f, "thermal: no heat at equilibrium keeps exactly 45 degC");
+    for (current_A = 0.0f; current_A <= 2.0f; current_A += 0.005f) {
+        (void)ev_predict_cell(&config, &state, current_A, HORIZON_S, &p);
+        monotone = monotone && (p.predicted_temperature_C >= previous_C);
+        previous_C = p.predicted_temperature_C;
+    }
+    check(monotone, "thermal: prediction monotone in current at the 45 degC edge");
+}
+
 static void test_single_cell_limit_matches_pack(void) {
     Pack pack;
     EvPackResult result;
@@ -616,6 +940,14 @@ static bool self_test(void) {
     test_terminal_voltage_bound_covers_whole_horizon();
     test_over_voltage_fault();
     test_stuck_voltage_sensor_is_detected();
+    test_frozen_in_range_sensor_is_detected();
+    test_frozen_sensor_detected_when_charge_starts();
+    test_noisy_frozen_sensor_is_detected();
+    test_frozen_sensor_fault_stays_latched();
+    test_no_false_frozen_fault_with_mismatch();
+    test_tracking_tolerates_parameter_mismatch();
+    test_limit_monotone_in_request();
+    test_over_current_fault();
     test_config_fault_marks_soc_stale();
     test_input_fault_is_held();
     test_horizon_covers_control_period();
@@ -623,6 +955,8 @@ static bool self_test(void) {
     test_end_of_life_and_growth_clamp();
     test_ageing_and_cold_reduce_the_limit();
     test_single_cell_limit_matches_pack();
+    test_gradients_remember_previous_current();
+    test_thermal_prediction_exact_at_equilibrium();
     return g_failures == 0;
 }
 

@@ -4,6 +4,7 @@ functions and the stoichiometry windows in the header.
     python tools/generate_ocv_lut.py           # rewrite the tables in place
     python tools/generate_ocv_lut.py --check   # exit 1 if the tables are out of date
 """
+import argparse
 import re
 import sys
 
@@ -28,6 +29,9 @@ def generated_block():
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--check", action="store_true", help="exit 1 if the tables are out of date")
+    args = parser.parse_args()
     with open(m.C_SOURCE, encoding="utf-8") as handle:
         source = handle.read()
     pattern = re.compile(re.escape(BEGIN) + r".*?" + re.escape(END), re.DOTALL)
@@ -35,7 +39,7 @@ def main():
         print(f"generated-table markers not found in {m.C_SOURCE}")
         return 2
     updated = pattern.sub(lambda _: generated_block(), source)
-    if "--check" in sys.argv[1:]:
+    if args.check:
         if updated != source:
             print("OCV tables are out of date: run python tools/generate_ocv_lut.py")
             return 1
