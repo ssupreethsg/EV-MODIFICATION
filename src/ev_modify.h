@@ -7,7 +7,7 @@
  *
  *     EvCellConfig config[EV_NUM_CELLS];   // filled once by the integrator
  *     EvCellState  state[EV_NUM_CELLS];
- *     if (!nvm_restore(state)) {            // integrator's CRC-checked copy, tagged EV_STATE_LAYOUT_VERSION
+ *     if (!nvm_restore(state)) {            // integrator's CRC-checked copy (layout_version is checked too)
  *         for (i = 0; i < EV_NUM_CELLS; ++i) { ev_cell_init(&state[i], initial_soc[i], initial_temp_C[i]); }
  *     }                                      // new cell only: ev_cell_init() clears latches and ageing
  *     ...
@@ -30,7 +30,10 @@ extern "C" {
 #endif
 
 #define EV_NUM_CELLS 4U
-#define EV_STATE_LAYOUT_VERSION 3U   /* changes whenever EvCellState changes: tag persisted copies with it */
+#define EV_MODIFY_VERSION_MAJOR 2   /* library version; CMake checks it against project(VERSION) */
+#define EV_MODIFY_VERSION_MINOR 0
+#define EV_MODIFY_VERSION_PATCH 0
+#define EV_STATE_LAYOUT_VERSION 4U   /* EvCellState.layout_version; changes whenever EvCellState changes */
 
 /* ---- Physical constants ---------------------------------------------------------------- */
 #define EV_FARADAY_C_PER_MOL 96485.33212f
@@ -63,6 +66,7 @@ extern "C" {
 #define EV_INTERMITTENT_SAMPLES 2.5f         /* decaying count of invalid voltage samples (3 within about 20 s) ... */
 #define EV_INTERMITTENT_WINDOW_S 60.0f       /* ... decaying with this time constant => EV_FAULT_VOLTAGE_SENSOR, latched */
 #define EV_TRACK_FAULT_CONFIRM_S 3.0f        /* ... sustained this long (seconds, at least 2 cycles) => plausibility fault, latched until ev_clear_latched_faults() */
+#define EV_TRACK_SUSPECT_LATCH_SOC 0.10       /* charge counted while suspect, never validating, beyond this fraction of capacity => plausibility fault, latched */
 #define EV_TRACK_VALIDATE_V 0.030f           /* window validated (and restarted) once the reading has moved this much beyond the tolerance, as modelled */
 #define EV_TRACK_SPIKE_V 0.050f              /* consecutive readings further apart than this are not used to (re)start a window */
 #define EV_TRACK_R1_UNCERTAINTY 1.0f         /* relative R1 error allowed for; with any time constant the plant RC voltage lies in [0, (1 + u) R1 dI] */
@@ -70,12 +74,14 @@ extern "C" {
 #define EV_TRACK_SOC_BIAS 0.05             /* SOC error beyond the EKF's 3 sigma that resistance errors can cause (R0 +30 %, R1 x2) */
 #define EV_TRACK_CAPACITY_UNCERTAINTY 0.2f   /* relative error of the open-loop OCV change (capacity, OCV slope) */
 #define EV_TRACK_REST_C_RATE 0.02f           /* below this |current| / capacity [1/h] the cell counts as at rest */
-/* Measured charge current must follow the approved command (charger ignoring the limit). */
-#define EV_OVER_CURRENT_TOLERANCE_A 0.5f     /* allowed excess over the approved current ... */
+/* Measured charge current must follow the approved command (charger ignoring the limit). Every
+ * limit is computed at the highest current that can flow without a fault: the command plus this
+ * tolerance plus the current-sensor offset, so no excess the fault logic accepts is unbudgeted. */
+#define EV_OVER_CURRENT_TOLERANCE_C_RATE 0.02f /* allowed excess over the approved current, as a C-rate ... */
 #define EV_OVER_CURRENT_TOLERANCE_REL 0.05f  /* ... plus this fraction of it */
 #define EV_OVER_CURRENT_RAMP_S 2.0f          /* after a lower command the charger may ramp down linearly over this time */
 #define EV_OVER_CURRENT_CONFIRM_S 1.0f       /* excess sustained this long (in seconds, not cycles) => fault */
-#define EV_OVER_CHARGE_LIMIT_FRACTION 0.005f /* charge beyond the delivered-current bound (expected x 1.05 + offset), leaky over ... */
+#define EV_OVER_CHARGE_LIMIT_FRACTION 0.005f /* charge beyond expected x 1.05 + offset (a sustained excess inside the tolerance), leaky over ... */
 #define EV_CURRENT_OFFSET_C_RATE 0.01f       /* current-sensor offset after zero calibration, as a C-rate (requirement) */
 #define EV_OVER_CHARGE_LEAK_S 3600.0f        /* ... this time constant, above this fraction of capacity => over-current fault */
 #define EV_SOC_DIVERGENCE_LIMIT 0.02         /* EKF below the coulomb count since the sensor last worked, beyond 3 sigma => fault */
@@ -116,7 +122,11 @@ extern "C" {
  * end above it, so it is the smallest i0 the range allows on either side. */
 #define EV_KINETIC_ACTIVATION_ENERGY_COLD_J_MOL 60000.0f
 #define EV_KINETIC_ACTIVATION_ENERGY_WARM_J_MOL 35000.0f
-#define EV_DIFFUSION_ACTIVATION_ENERGY_J_MOL 35000.0f    /* placeholder (Chen2020 gives none) */
+/* Graphite solid-diffusivity activation energy: Chen2020 gives none; reported values span about
+ * 17 (O'Regan2022) to 43 kJ/mol (Mohtat2020), and the DFN check sweeps up to 60. The same rule as
+ * for i0 gives the smallest diffusivity (largest surface rise, slowest relaxation) on either side. */
+#define EV_DIFFUSION_ACTIVATION_ENERGY_COLD_J_MOL 60000.0f
+#define EV_DIFFUSION_ACTIVATION_ENERGY_WARM_J_MOL 17000.0f
 
 /* Electrolyte: LiPF6 in EC:EMC, Nyman2008 values at 1 mol/L */
 #define EV_ELECTROLYTE_CONCENTRATION_MOL_M3 1000.0f
@@ -174,8 +184,9 @@ typedef struct {
                                     * maker's temperature derating when the coolant temperature changes */
 } EvCellConfig;
 
-/* Per-cell persistent state. Initialise with ev_cell_init(); afterwards only ev_step() writes it. */
+/* Per-cell persistent state. Initialise with ev_cell_init(); afterwards only the library's functions (ev_step(), ev_step_with_pack_voltage(), ev_clear_latched_faults()) write it. */
 typedef struct {
+    uint32_t layout_version;       /* EV_STATE_LAYOUT_VERSION, set by ev_cell_init(); any other value => EV_FAULT_STATE until ev_cell_init() */
     double soc;                    /* [0, 1] EKF estimate */
     double covariance[3];          /* EKF covariance of [soc, v_rc]: P00, P01, P11 */
     double soh;                    /* [EV_MIN_SOH, 1] capacity retention, never increases */
@@ -214,6 +225,7 @@ typedef struct {
     float invalid_voltage_score;   /* invalid voltage samples, decaying with EV_INTERMITTENT_WINDOW_S */
     bool voltage_sensor_latched;   /* intermittent voltage reading: latched until ev_clear_latched_faults() */
     bool track_suspect;            /* mismatch above EV_TRACK_SUSPECT_V: EKF ignores the reading until it validates */
+    double suspect_charge;         /* |charge| / capacity counted while suspect (latched at EV_TRACK_SUSPECT_LATCH_SOC) */
     float commanded_current_A;     /* approved current of the previous ev_step() (0 after a FAULT) */
     float ramp_from_A;             /* level the charger may still be ramping down from */
     float ramp_age_s;              /* time since that ramp started */
@@ -283,9 +295,10 @@ typedef struct {
 
 /* Sets a fresh state for a NEW cell: given SOC (clamped to [0, 1]) with sigma 0.05, zero
  * polarisation, soh = 1 and no faults. Call it at commissioning only: across power cycles,
- * save the whole EvCellState to non-volatile memory with a CRC and EV_STATE_LAYOUT_VERSION and
- * restore it, so SOH, resistance growth and latched faults survive a reboot. ev_step() range-checks
- * the numeric fields of a restored state; it cannot check the bool latches, hence the CRC. Pass a SOC from a rested OCV reading; if it is unknown pass NaN
+ * save the whole EvCellState to non-volatile memory with a CRC and restore it, so SOH, resistance
+ * growth and latched faults survive a reboot. ev_step() checks a restored state's layout_version,
+ * numeric ranges and flag bytes; a flag flipped between valid values needs the CRC to be caught.
+ * Pass a SOC from a rested OCV reading; if it is unknown pass NaN
  * (sigma 0.5: charging stays blocked until the EKF has converged). */
 void ev_cell_init(EvCellState *state, double initial_soc, float initial_temperature_C);
 

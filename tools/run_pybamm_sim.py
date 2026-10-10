@@ -22,17 +22,20 @@ Every sample convention follows ev_step(): current_A[i] is the current over (t[i
    an exchange-current activation energy of 53.4 kJ/mol (Ecker 2015) and 60 kJ/mol (an Arrhenius
    multiplier on the negative-electrode exchange-current density relative to 298.15 K, DFN only). The
    worst case per temperature is reported. In every case the DFN anode potential vs Li/Li+
-   (phi_s - phi_e) must stay >= 0 V everywhere in the electrode, the DFN terminal voltage must stay
-   <= 4.2 V + 5 mV, and no fault may occur. The final-SOC floors (the limiter must still charge)
-   are evaluated on the nominal case (17 / 35 kJ/mol). Extra cases: 2 degC from 75 % SOC on the
-   harshest corner including i0 60 kJ/mol (exercises the cold CV taper); a lumped-thermal DFN at
-   25 degC with the controller fed the DFN cell temperature (max <= 45 degC). The isothermal cases
-   cannot show self-heating; only the lumped case does.
-   Charger tolerance, at 2 degC from 50 % SOC on the harsh corner with i0 60 kJ/mol. In all other
-   cases the plant receives exactly the approved command. (a) The charger delivers 1.05 x command +
-   0.05 A, the edge of the tolerance the controller budgets for: anode potential >= 0 V and no fault.
-   (b) It delivers 1.05 x command + 0.49 A, outside the tolerance: EV_FAULT_OVER_CURRENT (0x800) must
-   appear in the fault flags within 600 s, and the anode potential must still stay >= 0 V. In every
+   (phi_s - phi_e) must stay >= 5 mV (the controller's own margin) at every point and time step, the
+   DFN terminal voltage must stay <= 4.2 V + 5 mV, and no fault may occur. The final-SOC floors (the
+   limiter must still charge) are evaluated on the nominal case (17 / 35 kJ/mol). Extra cases: 2 degC
+   from 75 % SOC on the harshest corner including i0 60 kJ/mol (exercises the cold CV taper); a
+   lumped-thermal DFN at 25 degC with the controller fed the DFN cell temperature (max <= 45 degC);
+   O'Regan2022's graphite diffusivity and exchange current (fitted together on the same cell) at 10
+   and 25 degC. The isothermal cases cannot show self-heating; only the lumped case does.
+   Sensor errors at their limits, on the harsh corner with i0 60 kJ/mol: the DFN is at 0 degC while
+   the controller reads 2 degC (EV_TEMPERATURE_SENSOR_MARGIN_C). (a) From 5 % SOC with an exact
+   charger. (b) From 50 % SOC, the charger delivers 1.05 x command + 0.99 x C/50 (just inside the fast
+   over-current tolerance) and the current sensor reads C/100 low: only the over-charge integral may
+   fault, not before 1500 s. (c) The charger delivers 1.05 x command + 1.5 x C/50, outside the
+   tolerance: EV_FAULT_OVER_CURRENT (0x800) must appear within 30 s. Each must stay >= 5 mV, and (a)
+   and (b) must charge at least 5 % SOC, so they cannot pass by never charging. In every
    case a charger obeys a stop: when the controller approves 0 A (end of charge or a fault) the
    plant delivers 0 A, and the run ends.
 
@@ -78,16 +81,22 @@ DFN_I0_EA_J_MOL = (53400.0, 60000.0)  # graphite exchange-current activation ene
 DFN_I0_NOMINAL_EA_J_MOL = 35000.0  # Chen2020's own value
 DFN_COLD_CV_START_SOC = 0.75
 DFN_TOLERANCE_START_SOC = 0.5
-DFN_CHARGER_REL = 1.05  # the controller's EV_OVER_CURRENT_TOLERANCE_REL
-DFN_CHARGER_EDGE_OFFSET_A = 0.05  # EV_CURRENT_OFFSET_A: the edge of the budgeted tolerance
-DFN_CHARGER_OUT_OFFSET_A = 0.49  # just below EV_OVER_CURRENT_TOLERANCE_A (0.5 A): outside the tolerance
+DFN_CHARGER_REL = 1.0 + m.header_constant("EV_OVER_CURRENT_TOLERANCE_REL")
+DFN_TOLERANCE_C_RATE = m.header_constant("EV_OVER_CURRENT_TOLERANCE_C_RATE")  # fast over-current tolerance [1/h]
+DFN_SENSOR_OFFSET_C_RATE = m.header_constant("EV_CURRENT_OFFSET_C_RATE")  # current-sensor offset requirement [1/h]
+DFN_EDGE_FRACTION = 0.99  # charger excess as a fraction of the tolerance: just inside it
+DFN_OUT_FRACTION = 1.5  # ... and outside it
 FAULT_OVER_CURRENT = 0x800  # EV_FAULT_OVER_CURRENT
-DFN_OVER_CURRENT_DEADLINE_S = 600.0
+DFN_OVER_CURRENT_DEADLINE_S = 30.0  # outside the tolerance: the fast check (1 s)
+DFN_OVER_CHARGE_EARLIEST_S = 1500.0  # just inside it: only the over-charge integral may fault, and not before this
+DFN_SENSOR_BIAS_C = m.header_constant("EV_TEMPERATURE_SENSOR_MARGIN_C")  # temperature reading warmer than the cell
+DFN_BIAS_MIN_CHARGE = 0.05  # SOC the sensor-bias cases must charge, so that they are not vacuous
 DFN_MAX_VOLTAGE_V = 4.2 + 0.005
 DFN_MAX_TEMPERATURE_C = 45.0
 # The limiter must keep charging, not just stay safe. These are anti-vacuity floors, ~5 points below
-# the measured result; the controller budgets for the charger tolerance (5 % + 0.05 A) in every limit.
-DFN_MIN_FINAL_SOC = {2.0: 0.45, 10.0: 0.60, 25.0: 0.90}
+# the measured result (46.8 / 65.1 / 94.9 %); every limit budgets the charger tolerance (5 % + C/50)
+# and the C/100 current-sensor offset.
+DFN_MIN_FINAL_SOC = {2.0: 0.42, 10.0: 0.60, 25.0: 0.90}
 DFN_START_SOC = 0.05
 DFN_STEP_S = 10.0
 DFN_MAX_TIME_S = 2.0 * 3600.0
@@ -97,13 +106,16 @@ VALIDATION_PROFILE = [
     "Charge at 1C for 10 minutes or until 4.2 V",
     "Rest for 10 minutes",
 ] * 4 + ["Charge at 1C until 4.2 V"]
-PLATING_ONSET_V = 0.0
+PLATING_FLOOR_V = m.header_constant("EV_MIN_SAFE_ANODE_POTENTIAL_V")  # the controller's own margin, not 0 V
 
 
-def chen2020(temperature_C=TEMPERATURE_C, activation_J_mol=None, i0_activation_J_mol=None):
+def chen2020(temperature_C=TEMPERATURE_C, activation_J_mol=None, i0_activation_J_mol=None, oregan_anode=False):
     """Chen2020 parameters; activation_J_mol = (electrolyte, solid) adds Arrhenius terms (DFN only).
     i0_activation_J_mol multiplies the negative-electrode exchange-current density by an Arrhenius
-    factor exp(Ea - 35 kJ/mol) relative to 298.15 K, i.e. replaces Chen2020's own 35 kJ/mol (DFN only)."""
+    factor exp(Ea - 35 kJ/mol) relative to 298.15 K, i.e. replaces Chen2020's own 35 kJ/mol (DFN only).
+    oregan_anode=True replaces the graphite diffusivity and exchange-current density by the pair
+    O'Regan et al. (2022) measured on the same LG M50 cell, with their own temperature dependence;
+    the two are fitted together, so they are swapped together (DFN only)."""
     parameter_values = pybamm.ParameterValues("Chen2020")
     x0, x100, y100, y0 = pybamm.lithium_ion.get_min_max_stoichiometries(parameter_values)
     for name, value, header in (
@@ -130,6 +142,17 @@ def chen2020(temperature_C=TEMPERATURE_C, activation_J_mol=None, i0_activation_J
                 "Electrolyte conductivity [S.m-1]": lambda c, T: kappa(c, T) * factor(electrolyte_ea, T),
                 "Electrolyte diffusivity [m2.s-1]": lambda c, T: diffusivity(c, T) * factor(electrolyte_ea, T),
                 "Negative particle diffusivity [m2.s-1]": lambda sto, T: solid_diffusivity * factor(solid_ea, T),
+            }
+        )
+    if oregan_anode:
+        from pybamm.input.parameters.lithium_ion import ORegan2022
+
+        parameter_values.update(
+            {
+                "Negative particle diffusivity [m2.s-1]": ORegan2022.graphite_LGM50_diffusivity_ORegan2022,
+                "Negative electrode exchange-current density [A.m-2]": (
+                    ORegan2022.graphite_LGM50_electrolyte_exchange_current_density_ORegan2022
+                ),
             }
         )
     if i0_activation_J_mol is not None:
@@ -236,6 +259,9 @@ def dfn_closed_loop(
     thermal=False,
     i0_activation_J_mol=None,
     charger_offset_A=None,
+    sensor_offset_A=0.0,
+    temperature_bias_C=0.0,
+    oregan_anode=False,
 ):
     """Complete C controller charging a DFN. Returns a dict: min anode potential vs Li/Li+ [V], max
     terminal voltage [V], max cell temperature [degC], cycles with fault flags, final SOC and the
@@ -243,8 +269,9 @@ def dfn_closed_loop(
     if never). With thermal=True the DFN is lumped-thermal (ambient temperature_C) and the controller
     is fed the DFN cell temperature. charger_offset_A=None: the plant receives exactly the approved
     command; otherwise it receives DFN_CHARGER_REL x command + charger_offset_A (0 A when the command
-    is 0 A: the charger obeys a stop)."""
-    parameter_values, capacity_Ah = chen2020(temperature_C, activation_J_mol, i0_activation_J_mol)
+    is 0 A: the charger obeys a stop). The controller reads the current sensor_offset_A low and the
+    temperature temperature_bias_C high (sensor errors in the unsafe direction)."""
+    parameter_values, capacity_Ah = chen2020(temperature_C, activation_J_mol, i0_activation_J_mol, oregan_anode)
     parameter_values.update({"Current function [A]": "[input]"})
     parameter_values.set_initial_state(start_soc)
     model = pybamm.lithium_ion.DFN({"thermal": "lumped"} if thermal else {})
@@ -259,14 +286,15 @@ def dfn_closed_loop(
             f"{r1:.6f}",
             f"{tau:.6f}",
             f"{start_soc:.6f}",
-            f"{temperature_C:.3f}",
+            f"{temperature_C + temperature_bias_C:.3f}",  # initial reading and coolant, as the BMS sees them
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
     )
     soc, elapsed, min_potential, faults = start_soc, 0.0, np.inf, 0
-    over_current_time_s = None
+    over_current_time_s = first_fault_s = None
+    fault_flags = 0
     max_voltage, max_temperature_C = -np.inf, temperature_C
     trace = []
     current_A = 0.0  # current over the interval that just ended (a rested start)
@@ -276,9 +304,10 @@ def dfn_closed_loop(
             voltage_V = float(sol["Voltage [V]"].entries[-1])
             cell_C = (
                 float(sol["Volume-averaged cell temperature [K]"].entries[-1]) - 273.15 if thermal else temperature_C
-            )
+            ) + temperature_bias_C
+            measured_A = current_A - sensor_offset_A if current_A > 0.0 else current_A
             process.stdin.write(
-                f"{DFN_STEP_S} {current_A:.6f} {voltage_V:.6f} {cell_C:.3f} {DFN_REQUEST_A} {DFN_HORIZON_S}\n"
+                f"{DFN_STEP_S} {measured_A:.6f} {voltage_V:.6f} {cell_C:.3f} {DFN_REQUEST_A} {DFN_HORIZON_S}\n"
             )
             process.stdin.flush()
             line = process.stdout.readline()
@@ -287,6 +316,9 @@ def dfn_closed_loop(
             fields = line.split()
             command_A, flags = float(fields[0]), int(fields[2])
             faults += int(flags != 0)
+            fault_flags |= flags
+            if flags and first_fault_s is None:
+                first_fault_s = elapsed
             if (flags & FAULT_OVER_CURRENT) and over_current_time_s is None:
                 over_current_time_s = elapsed
             if command_A < 0.01 and trace:
@@ -295,7 +327,7 @@ def dfn_closed_loop(
             if charger_offset_A is not None and command_A >= 0.01:
                 current_A = DFN_CHARGER_REL * command_A + charger_offset_A
             sol = sim.step(DFN_STEP_S, inputs={"Current function [A]": -current_A}, save=False)
-            potential = sol["Negative electrode surface potential difference [V]"].entries[:, -1]
+            potential = sol["Negative electrode surface potential difference [V]"].entries  # every point and sample
             min_potential = min(min_potential, float(np.min(potential)))
             max_voltage = max(max_voltage, float(np.max(sol["Voltage [V]"].entries)))
             if thermal:
@@ -320,6 +352,8 @@ def dfn_closed_loop(
         "max_temperature": max_temperature_C,
         "faults": faults,
         "over_current_time_s": over_current_time_s,
+        "first_fault_s": first_fault_s,
+        "fault_flags": fault_flags,
         "final_soc": float(trace[-1, 1]) if trace.size else start_soc,
         "trace": trace,
     }
@@ -452,8 +486,19 @@ def main():
     dfn_traces = []
     if not args.skip_dfn:
 
-        def run_case(label, temperature_C, activation, expect_over_current=False, **kwargs):
+        def run_case(
+            label,
+            temperature_C,
+            activation,
+            expect_over_current=False,
+            allow_over_charge=False,
+            min_charge=0.0,
+            **kwargs,
+        ):
             result = dfn_closed_loop(cli, temperature_C, params, activation, **kwargs)
+            if min_charge > 0.0:  # a case that never charged would pass the potential check vacuously
+                charged = result["final_soc"] - kwargs.get("start_soc", DFN_START_SOC)
+                checks.append((f"DFN {label} SOC charged (>= {min_charge})", -charged, -min_charge))
             over_current_s = result["over_current_time_s"]
             print(
                 f"DFN case {label}: SOC {kwargs.get('start_soc', DFN_START_SOC):.2f} -> {result['final_soc']:.3f}, "
@@ -465,9 +510,9 @@ def main():
             )
             checks.append(
                 (
-                    f"DFN {label} min anode potential (>= {PLATING_ONSET_V} V) [V]",
+                    f"DFN {label} min anode potential (>= {PLATING_FLOOR_V} V) [V]",
                     -result["min_potential"],
-                    -PLATING_ONSET_V,
+                    -PLATING_FLOOR_V,
                 )
             )
             checks.append(
@@ -485,6 +530,13 @@ def main():
                         DFN_OVER_CURRENT_DEADLINE_S,
                     )
                 )
+            elif allow_over_charge:
+                # only the over-charge integral may stop a charger inside the fast tolerance, and only late
+                late = result["first_fault_s"] is None or (
+                    result["fault_flags"] & ~FAULT_OVER_CURRENT == 0
+                    and result["first_fault_s"] >= DFN_OVER_CHARGE_EARLIEST_S
+                )
+                checks.append((f"DFN {label} early or non-over-current fault (0 = none)", int(not late), 0))
             else:
                 checks.append((f"DFN {label} cycles with a fault", result["faults"], 0))
             return result
@@ -526,18 +578,46 @@ def main():
             start_soc=DFN_COLD_CV_START_SOC,
             i0_activation_J_mol=i0_worst,
         )
-        for name, offset_A, expect in (
-            ("charger 1.05 x command + 0.05 A", DFN_CHARGER_EDGE_OFFSET_A, False),
-            ("charger 1.05 x command + 0.49 A (outside tolerance)", DFN_CHARGER_OUT_OFFSET_A, True),
+        # Sensor errors at their limits in the unsafe direction: the cell is EV_TEMPERATURE_SENSOR_MARGIN_C
+        # colder than its reading and the current sensor reads C/100 low; the charger delivers 1.05 x
+        # command plus an excess just inside, or outside, the fast tolerance (C/50).
+        capacity = chen2020(0.0)[1]
+        tolerance_A, sensor_A = DFN_TOLERANCE_C_RATE * capacity, DFN_SENSOR_OFFSET_C_RATE * capacity
+        bias = f"cell {DFN_SENSOR_BIAS_C:.0f} degC below its reading"
+        run_case(
+            f"0 degC ({bias}) {harsh} i0={i0_worst / 1000:g} kJ/mol",
+            0.0,
+            DFN_HARSH_EA_J_MOL,
+            i0_activation_J_mol=i0_worst,
+            temperature_bias_C=DFN_SENSOR_BIAS_C,
+            min_charge=DFN_BIAS_MIN_CHARGE,
+        )
+        for name, excess_A, expect, allow in (
+            (
+                f"charger excess {DFN_EDGE_FRACTION:g} x tolerance, sensor {sensor_A:.3f} A low",
+                DFN_EDGE_FRACTION * tolerance_A + sensor_A,
+                False,
+                True,
+            ),
+            (f"charger excess {DFN_OUT_FRACTION:g} x tolerance (outside)", DFN_OUT_FRACTION * tolerance_A, True, False),
         ):
             run_case(
-                f"2 degC from SOC {DFN_TOLERANCE_START_SOC:.2f} {harsh} i0={i0_worst / 1000:g} kJ/mol, {name}",
-                2.0,
+                f"0 degC ({bias}) from SOC {DFN_TOLERANCE_START_SOC:.2f} {harsh} i0={i0_worst / 1000:g} kJ/mol, {name}",
+                0.0,
                 DFN_HARSH_EA_J_MOL,
                 expect_over_current=expect,
+                allow_over_charge=allow,
                 start_soc=DFN_TOLERANCE_START_SOC,
                 i0_activation_J_mol=i0_worst,
-                charger_offset_A=offset_A,
+                charger_offset_A=excess_A,
+                sensor_offset_A=sensor_A if allow else 0.0,
+                temperature_bias_C=DFN_SENSOR_BIAS_C,
+                min_charge=DFN_BIAS_MIN_CHARGE if allow else 0.0,
+            )
+        # An independent graphite transport/kinetics pair for the same cell (O'Regan et al. 2022).
+        for temperature_C in (10.0, 25.0):
+            run_case(
+                f"{temperature_C:.0f} degC O'Regan2022 graphite D_s and i0", temperature_C, None, oregan_anode=True
             )
         thermal = run_case("25 degC lumped-thermal", 25.0, DFN_NOMINAL_EA_J_MOL, thermal=True)
         checks.append(

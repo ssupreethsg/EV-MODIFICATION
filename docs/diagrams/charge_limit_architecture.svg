@@ -51,9 +51,11 @@
   <text x="1395" y="270" text-anchor="middle" class="box-text">anode ≥ 5 mV, V ≤ 4.2 V</text>
   <text x="1395" y="302" text-anchor="middle" class="box-text">SOC ≤ 98 %, depletion</text>
   <text x="1395" y="334" text-anchor="middle" class="box-text">0 °C ≤ T − 2 °C, T ≤ 45 °C</text>
-  <text x="1395" y="384" text-anchor="middle" class="box-text">sweep + 24-step bisection</text>
-  <text x="1395" y="416" text-anchor="middle" class="box-text">at command × 1.05 + 0.05 A</text>
-  <text x="1395" y="462" text-anchor="middle" class="box-title" style="font-size:20px">ALLOW / LIMIT / FAULT</text>
+  <text x="1395" y="370" text-anchor="middle" class="box-text">sweep + 24-step bisection</text>
+  <text x="1395" y="394" text-anchor="middle" class="box-text">limits at command × 1.05</text>
+  <text x="1395" y="416" text-anchor="middle" class="box-text">+ C/50 tolerance</text>
+  <text x="1395" y="438" text-anchor="middle" class="box-text">+ C/100 sensor offset</text>
+  <text x="1395" y="476" text-anchor="middle" class="box-title" style="font-size:20px">ALLOW / LIMIT / FAULT</text>
 
   <path d="M280 320 H350" class="arrow"/>
   <path d="M560 320 H630" class="arrow"/>

@@ -1,5 +1,5 @@
 # Lint rules for tools/ and tests/ (CI pins ruff 0.6.9).
-target-version = "py312"
+target-version = "py313"
 line-length = 120
 
 [lint]

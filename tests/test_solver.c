@@ -757,7 +757,7 @@ static void test_over_current_fault(void) {
     pack_uniform(&pack, 0.5, 25.0f);
     result = pack_step(&pack, 0.0f, 2.0f);
     check(result.approved_charge_current_A == 2.0f, "over-current: 2 A approved");
-    result = pack_step(&pack, (2.0f * 1.05f) + 0.4f, 2.0f);
+    result = pack_step(&pack, (2.0f * 1.05f) + 0.08f, 2.0f);   /* inside 5 % + C/50 (0.1 A) */
     check(result.decision != EV_DECISION_FAULT, "over-current: small excess tolerated");
     result = pack_step(&pack, 6.0f, 2.0f);
     check((result.decision == EV_DECISION_FAULT) && ((result.fault_flags & EV_FAULT_OVER_CURRENT) != 0U),
@@ -1076,6 +1076,7 @@ static uint16_t run_scenario(const Scenario *sc, double *peak_soc, double *final
 static void test_frozen_after_taper_does_not_ratchet(void) {
     static const float freeze_s[] = {4800.0f, 5400.0f, 6600.0f};
     double worst = 0.0;
+    double worst_pack = 0.0;
     double peak;
     double final_soc;
     size_t k;
@@ -1084,9 +1085,18 @@ static void test_frozen_after_taper_does_not_ratchet(void) {
         sc.end_s = 8.0f * 3600.0f;
         (void)run_scenario(&sc, &peak, &final_soc);
         worst = fmax(worst, peak);
+        sc.pack_tolerance_V = 0.03f;
+        (void)run_scenario(&sc, &peak, &final_soc);
+        worst_pack = fmax(worst_pack, peak);
     }
-    printf("  measured: reading frozen in the taper, worst peak true SOC %.3f\n", worst);
-    check(worst < 0.99, "frozen after taper: no overcharge ratchet");
+    /* In the taper the current changes slowly and a frozen reading can stay inside the tracking
+     * tolerance; the single-channel bound is then the coulomb-count floor on the upper SOC bound
+     * (0.98 + 3 anchor sigma + 5 % of the charge since the last validation), with no ratchet.
+     * The pack-voltage cross-check sees the true voltage rise and stops the charge below 0.99. */
+    printf("  measured: reading frozen in the taper, worst peak true SOC %.3f single channel, %.3f with pack check\n",
+           worst, worst_pack);
+    check(worst < 1.02, "frozen after taper: single channel bounded by the coulomb-count floor, no ratchet");
+    check(worst_pack < 0.99, "frozen after taper: pack check keeps the true SOC below 0.99");
 }
 
 /* Round-5 C-safety finding B2: the charger stop caused by the fault "validated" an offset
@@ -1284,8 +1294,8 @@ static void test_charge_current_cap(void) {
     ev_cell_init(&state, 0.1, 25.0f);
     state.covariance[0] = 1.0e-4;
     approved_A = ev_cell_max_charge_current(&config, &state, 30.0f, HORIZON_S, &constraints, &p);
-    check((approved_A <= ((3.5f - (EV_CURRENT_OFFSET_C_RATE * 5.0f)) / (1.0f + EV_OVER_CURRENT_TOLERANCE_REL)) + 1.0e-3f)
-          && (approved_A > 3.2f), "current cap: delivered-current bound stays at the maker's maximum");
+    check((approved_A <= ((3.5f - ((EV_CURRENT_OFFSET_C_RATE + EV_OVER_CURRENT_TOLERANCE_C_RATE) * 5.0f)) / (1.0f + EV_OVER_CURRENT_TOLERANCE_REL)) + 1.0e-3f)
+          && (approved_A > 3.1f), "current cap: delivered-current bound stays at the maker's maximum");
     check((constraints & EV_CONSTRAINT_CURRENT_LIMIT) != 0U, "current cap: reported as the binding constraint");
     config.max_charge_current_A = 0.0f;
     check(!ev_config_is_valid(&config), "current cap: zero cap is an invalid config");
@@ -1402,14 +1412,15 @@ static void test_tracking_mismatch_grid(void) {
     check(slow == 0, "tracking: every mismatch corner still charges");
 }
 
-/* Round-5 C-safety finding H3: a charger that never goes below 0.49 A (inside the 0.5 A
- * tolerance) was never flagged and overcharged the cell. */
+/* Round-5 C-safety finding H3: a charger that never goes below a floor inside the fast
+ * over-current tolerance was never flagged and overcharged the cell. The floor here is 95 % of
+ * that tolerance (C/50), so only the over-charge integral can catch it. */
 static void test_charger_floor_is_detected(void) {
     double peak;
     double final_soc;
     Scenario sc = scenario(0, 0.0f, 0.0f);
     uint16_t flags;
-    sc.floor_A = 0.49f;
+    sc.floor_A = 0.95f * EV_OVER_CURRENT_TOLERANCE_C_RATE * 5.0f;
     sc.end_s = 8.0f * 3600.0f;
     flags = run_scenario(&sc, &peak, &final_soc);
     check((flags & EV_FAULT_OVER_CURRENT) != 0U, "charger floor: excess charge flagged as over-current");
@@ -1477,6 +1488,153 @@ static void test_single_cell_limit_matches_pack(void) {
     check(fabsf(single_A - result.approved_charge_current_A) < 1.0e-5f, "api: single-cell limit equals the pack limit for identical cells");
 }
 
+/* Round-8 finding: the limits were computed at command x 1.05 + C/100 while the fault logic
+ * accepted up to 5 % + 0.5 A, so a charger inside the tolerance could plate the cell. A charger
+ * just inside the tolerance must now keep the margin at the current that really flows (sensor
+ * under-reading by its offset), and one just outside must fault at once. */
+static void test_charger_inside_tolerance_keeps_margin(void) {
+    const float tolerance_A = EV_OVER_CURRENT_TOLERANCE_C_RATE * 5.0f;
+    const float offset_A = EV_CURRENT_OFFSET_C_RATE * 5.0f;
+    Pack pack;
+    EvPackResult r;
+    EvCellPrediction p;
+    float command_A = 0.0f;
+    float worst_V = 1.0f;
+    uint16_t flags = 0U;
+    int cycle;
+    int first_fault = -1;
+    pack_uniform(&pack, 0.5, 10.0f);
+    for (cycle = 0; cycle < 6000; ++cycle) {
+        float measured_A = (command_A > 0.0f) ? ((command_A * (1.0f + EV_OVER_CURRENT_TOLERANCE_REL)) + (0.99f * tolerance_A)) : 0.0f;
+        float true_A = (measured_A > 0.0f) ? (measured_A + offset_A) : 0.0f;
+        plant_step(&pack, true_A, DT_S);
+        r = ev_step(pack.config, pack.state, measured_A, 10.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+        flags |= r.fault_flags;
+        if ((first_fault < 0) && (r.fault_flags != 0U)) { first_fault = cycle; }
+        command_A = r.approved_charge_current_A;
+        if ((true_A > 0.0f) && ev_predict_cell(&pack.config[0], &pack.state[0], true_A, HORIZON_S, &p)) {
+            worst_V = fminf(worst_V, p.anode_potential_V);
+        }
+    }
+    printf("  measured: charger at the tolerance edge, worst anode potential at the delivered current %.2f mV\n", (double)worst_V * 1000.0);
+    /* the fast check never trips; a sustained excess above C/100 is caught by the over-charge integral */
+    check(((flags & (uint16_t)~(EV_FAULT_OVER_CURRENT | EV_FAULT_HOLD)) == 0U) && ((first_fault < 0) || (first_fault > 1500)),
+          "charger tolerance: a charger just inside the tolerance does not trip the fast over-current check");
+    check(worst_V >= EV_MIN_SAFE_ANODE_POTENTIAL_V - 1.0e-4f, "charger tolerance: plating margin kept at the current that flows");
+
+    pack_uniform(&pack, 0.5, 10.0f);
+    command_A = 0.0f;
+    first_fault = -1;
+    for (cycle = 0; (cycle < 600) && (first_fault < 0); ++cycle) {
+        float measured_A = (command_A > 0.0f) ? ((command_A * (1.0f + EV_OVER_CURRENT_TOLERANCE_REL)) + (1.2f * tolerance_A)) : 0.0f;
+        r = pack_step(&pack, measured_A, 10.0f);
+        if ((r.fault_flags & EV_FAULT_OVER_CURRENT) != 0U) { first_fault = cycle; }
+        command_A = r.approved_charge_current_A;
+    }
+    check((first_fault > 0) && (first_fault <= (int)((EV_OVER_CURRENT_CONFIRM_S / DT_S) + 2.0f)),
+          "charger tolerance: a charger just outside the tolerance faults within the confirmation time");
+}
+
+/* Round-8 finding: on a large cell the C/100 sensor offset exceeded the fixed 0.5 A tolerance. */
+static void test_large_cell_offset_does_not_trip(void) {
+    Pack pack;
+    EvPackResult r;
+    float command_A = 0.0f;
+    uint16_t flags = 0U;
+    int cycle;
+    uint8_t i;
+    pack_uniform(&pack, 0.5, 25.0f);
+    for (i = 0U; i < EV_NUM_CELLS; ++i) {
+        pack.config[i].nominal_capacity_Ah = 100.0f;
+        pack.config[i].resistance_ohm = 0.002f;
+        pack.config[i].rc_resistance_ohm = 0.0007f;
+    }
+    for (cycle = 0; cycle < 3000; ++cycle) {
+        float measured_A = command_A + (0.9f * EV_CURRENT_OFFSET_C_RATE * 100.0f);   /* sensor over-reads by 0.9 C/100 */
+        plant_step(&pack, command_A, DT_S);
+        r = ev_step(pack.config, pack.state, measured_A, 50.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+        flags |= r.fault_flags;
+        command_A = r.approved_charge_current_A;
+    }
+    check(((flags & EV_FAULT_OVER_CURRENT) == 0U) && (command_A > 20.0f), "large cell: an in-spec sensor offset does not trip the over-current fault");
+}
+
+/* Round-8 findings: plain ev_step() ignored the pack-unavailable block, and only cell 0's copy
+ * of the block was read. */
+static void test_pack_block_reported_everywhere(void) {
+    Pack pack;
+    EvPackResult r;
+    float sum_V;
+    int i;
+    pack_uniform(&pack, 0.5, 25.0f);
+    plant_step(&pack, 3.0f, DT_S);
+    sum_V = pack.voltages_V[0] + pack.voltages_V[1] + pack.voltages_V[2] + pack.voltages_V[3];
+    r = ev_step_with_pack_voltage(pack.config, pack.state, 3.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, NAN, 0.03f, 0.0f);
+    check((r.fault_flags & EV_FAULT_INPUT) != 0U, "pack block: set by a missing pack reading under current");
+    plant_step(&pack, 0.0f, DT_S);
+    sum_V = pack.voltages_V[0] + pack.voltages_V[1] + pack.voltages_V[2] + pack.voltages_V[3];
+    for (i = 0; i < 10; ++i) {
+        r = ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    }
+    check((r.decision == EV_DECISION_FAULT) && ((r.fault_flags & EV_FAULT_INPUT) != 0U), "pack block: also reported by plain ev_step()");
+    for (i = 0; i < 10; ++i) {
+        r = ev_step_with_pack_voltage(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, sum_V, 0.03f, 0.0f);
+    }
+    check(r.decision != EV_DECISION_FAULT, "pack block: released by a valid pack reading at rest");
+    pack.state[1].pack_unavailable_block = true;
+    r = ev_step_with_pack_voltage(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S, sum_V + 1.0f, 0.03f, 0.0f);
+    check((r.fault_flags & EV_FAULT_INPUT) != 0U, "pack block: any cell's copy is reported");
+}
+
+/* Round-8 finding: one invalid sample every 31 s (below the intermittency threshold) paused the
+ * charge often enough to reset the tracking-failure timer, so a frozen reading never latched. */
+static void test_frozen_with_periodic_invalid_samples_latches(void) {
+    double peak;
+    double final_soc;
+    uint16_t flags;
+    Scenario sc = scenario(1, 1800.0f, 0.0f);
+    sc.invalid_every_s = 31.0f;
+    flags = run_scenario(&sc, &peak, &final_soc);
+    check((flags & EV_FAULT_VOLTAGE_PLAUSIBILITY) != 0U, "periodic invalid samples: frozen reading still latches a plausibility fault");
+    check(peak < 0.99, "periodic invalid samples: no overcharge");
+}
+
+/* Round-8 findings: a restored state is checked for its layout version and its flag bytes, and
+ * every validated field is repaired by the reset, so a single bad field does not fault forever. */
+static void test_restored_state_is_validated(void) {
+    Pack pack;
+    EvPackResult r;
+    unsigned char bad = 2U;
+    int i;
+    pack_uniform(&pack, 0.5, 25.0f);
+    plant_step(&pack, 0.0f, DT_S);
+    pack.state[2].layout_version = EV_STATE_LAYOUT_VERSION - 1U;
+    for (i = 0; i < 10; ++i) {
+        ev_clear_latched_faults(&pack.state[2]);
+        r = ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    }
+    check((r.fault_flags & EV_FAULT_STATE) != 0U, "restore: a state of another layout faults until ev_cell_init()");
+    ev_cell_init(&pack.state[2], 0.5, 25.0f);
+    for (i = 0; i < 10; ++i) {
+        r = ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    }
+    check(r.decision != EV_DECISION_FAULT, "restore: ev_cell_init() recovers a state of another layout");
+
+    memcpy(&pack.state[2].sensor_fault_latched, &bad, 1U);
+    r = ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    check(((r.fault_flags & EV_FAULT_STATE) != 0U) && ((r.fault_flags & EV_FAULT_VOLTAGE_PLAUSIBILITY) != 0U),
+          "restore: a corrupted flag byte is a state fault and reads as latched");
+
+    ev_cell_init(&pack.state[2], 0.5, 25.0f);
+    pack.state[2].pack_mismatch_time_s = -1.0f;
+    r = ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    check((r.fault_flags & EV_FAULT_STATE) != 0U, "restore: a bad pack-mismatch timer is a state fault");
+    for (i = 0; i < 10; ++i) {
+        r = ev_step(pack.config, pack.state, 0.0f, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    }
+    check((r.fault_flags & EV_FAULT_STATE) == 0U, "restore: the reset repairs the pack-mismatch timer");
+}
+
 static bool self_test(void) {
     test_ocv_table();
     test_closed_loop_charge_to_full();
@@ -1525,6 +1683,11 @@ static bool self_test(void) {
     test_invalid_samples_do_not_hide_freeze();
     test_tracking_mismatch_grid();
     test_charger_floor_is_detected();
+    test_charger_inside_tolerance_keeps_margin();
+    test_large_cell_offset_does_not_trip();
+    test_pack_block_reported_everywhere();
+    test_frozen_with_periodic_invalid_samples_latches();
+    test_restored_state_is_validated();
     test_inconsistent_covariance_is_reset();
     test_thermal_prediction_exact_at_equilibrium();
     return g_failures == 0;

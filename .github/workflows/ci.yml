@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, 'ccr-*']
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -34,7 +34,7 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Python lint (ruff)
         if: matrix.compiler == 'gcc'
-        run: pip install ruff==0.6.9 && ruff check tools tests && ruff format --check tools tests
+        run: pip install -r requirements-dev.txt && ruff check tools tests && ruff format --check tools tests
       - run: cmake -S . -B build -DCMAKE_C_COMPILER=${{ matrix.compiler }} -DEV_WARNINGS_AS_ERRORS=ON
       - run: cmake --build build
       - run: ctest --test-dir build --output-on-failure
@@ -111,6 +111,15 @@ jobs:
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wdouble-promotion -Werror \
             -Isrc -c src/ev_modify.c -o ev_modify_cm4.o
           arm-none-eabi-size ev_modify_cm4.o
+          text=$(arm-none-eabi-size ev_modify_cm4.o | awk 'NR==2 {print $1}')
+          echo "text size: $text bytes (limit 22000)"
+          test "$text" -le 22000
+      - name: Link a tiny main against newlib (catches missing libm and soft-float symbols)
+        run: |
+          arm-none-eabi-gcc -std=c11 -O2 -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wdouble-promotion -Werror \
+            -Isrc src/ev_modify.c tests/cm4/main.c -specs=nosys.specs -lm -o ev_modify_cm4.elf
+          arm-none-eabi-size ev_modify_cm4.elf
 
   static-analysis:
     name: Static analysis (cppcheck)

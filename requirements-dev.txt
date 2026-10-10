@@ -1,0 +1,2 @@
+# Lint tool pinned for CI (ruff check / ruff format --check).
+ruff==0.6.9

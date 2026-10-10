@@ -1,6 +1,21 @@
 cmake_minimum_required(VERSION 3.21)
 project(ev_modify VERSION 2.0.0 LANGUAGES C)
 
+# The version macros in the header must match project(VERSION ...).
+file(STRINGS src/ev_modify.h EV_HEADER_VERSION_LINES REGEX "^#define EV_MODIFY_VERSION_(MAJOR|MINOR|PATCH) +[0-9]+")
+foreach(part MAJOR MINOR PATCH)
+    set(EV_HEADER_VERSION_${part} "")
+    foreach(line IN LISTS EV_HEADER_VERSION_LINES)
+        if(line MATCHES "^#define EV_MODIFY_VERSION_${part} +([0-9]+)")
+            set(EV_HEADER_VERSION_${part} "${CMAKE_MATCH_1}")
+        endif()
+    endforeach()
+    if(NOT "${EV_HEADER_VERSION_${part}}" STREQUAL "${PROJECT_VERSION_${part}}")
+        message(FATAL_ERROR "src/ev_modify.h: EV_MODIFY_VERSION_${part} is '${EV_HEADER_VERSION_${part}}', "
+                            "but project() says ${PROJECT_VERSION_${part}}")
+    endif()
+endforeach()
+
 include(GNUInstallDirs)
 
 option(EV_BUILD_TESTS "Build the self-test, the CLI bridge and register the tests" ${PROJECT_IS_TOP_LEVEL})
@@ -80,7 +95,12 @@ if(EV_BUILD_TESTS)
                  COMMAND ${CMAKE_COMMAND} -DCLI=$<TARGET_FILE:ev_modify_cli> "-DCLI_ARGS=${cli_args}"
                          -DEXPECT=${expect} ${ARGN} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/check_cli.cmake)
     endfunction()
-    ev_add_cli_test(ok_ekf 0 "ekf|${EV_CLI_PACK}" "-DINPUT=1 0 3.7 25\\n")
+    # ekf prints "<soc> <soc_sigma> <rc_voltage_V> <decision> <fault_flags>": three reals and two integers.
+    ev_add_cli_test(ok_ekf 0 "ekf|${EV_CLI_PACK}" "-DINPUT=1 0 3.7 25\\n"
+                    "-DEXPECT_STDOUT_REGEX=^-?[0-9.]+ -?[0-9.]+ -?[0-9.]+ [0-9]+ [0-9]+$")
+    # limit prints "<approved_A> <anode_V> <terminal_V> <temperature_C> <constraints>": four reals and a bit mask.
+    ev_add_cli_test(ok_limit 0 "limit|${EV_CLI_CELL}|25" "-DINPUT=0.5 0.01 25 0 1 10 30\\n"
+                    "-DEXPECT_STDOUT_REGEX=^-?[0-9.]+ -?[0-9.]+ -?[0-9.]+ -?[0-9.]+ [0-9]+$")
     ev_add_cli_test(no_args 2 "")
     ev_add_cli_test(unknown_mode 2 "bogus")
     ev_add_cli_test(missing_args 2 "ekf|1.0")
@@ -98,6 +118,10 @@ if(EV_BUILD_TESTS)
     ev_add_cli_test(ekf_voltage_huge 3 "ekf|${EV_CLI_PACK}" "-DINPUT=1 0 1e300 25\\n")
     ev_add_cli_test(charge_dt_too_large 3 "charge|${EV_CLI_PACK}" "-DINPUT=30 1 3.7 25 10 30\\n")
     ev_add_cli_test(limit_soc_out_of_range 3 "limit|${EV_CLI_CELL}|25" "-DINPUT=2 0.01 25 0 1 10 30\\n")
+    # ev_cli.c: EV_CLI_LINE_LENGTH is 512, so lines of up to 510 characters are accepted and 511 are rejected.
+    string(REPEAT "0" 508 EV_CLI_ZEROS_510)
+    ev_add_cli_test(line_at_limit 0 "ocv" "-DINPUT=0.${EV_CLI_ZEROS_510}\\n")
+    ev_add_cli_test(line_too_long 3 "ocv" "-DINPUT=0.0${EV_CLI_ZEROS_510}\\n")
     ev_add_cli_test(nul_byte 3 "ocv" -DINPUT_FILE=${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/nul_line.bin)
     if(EXISTS "/dev/full")
         ev_add_cli_test(write_error 4 "ocv" "-DINPUT=0.5\\n" "-DOUTPUT_FILE=/dev/full")
