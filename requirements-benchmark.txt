@@ -1,4 +1,4 @@
 # Additionally needed by tools/run_pybamm_sim.py (validated with pybamm 26.10.0.0 on Python 3.13)
 -r requirements.txt
-pybamm>=26.7,<27
+pybamm>=26.9.0.0,<27
 matplotlib>=3.10,<3.12
