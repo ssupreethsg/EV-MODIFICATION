@@ -17,6 +17,7 @@ int main(void) {
         config[i].heat_capacity_J_kg_K = 1100.0f;
         config[i].coolant_temperature_C = 25.0f;
         config[i].max_charge_current_A = 20.0f;
+        config[i].anode_material_loss = 0.0f;
         ev_cell_init(&state[i], 0.5, 25.0f);
         voltages_V[i] = 3.7f;
         temperatures_C[i] = 25.0f;

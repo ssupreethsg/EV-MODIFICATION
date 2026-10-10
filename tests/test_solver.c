@@ -44,6 +44,7 @@ static EvCellConfig lgm50_config(void) {
     config.heat_capacity_J_kg_K = 1100.0f;
     config.coolant_temperature_C = 25.0f;
     config.max_charge_current_A = EV_MAX_PLAUSIBLE_CURRENT_A;   /* no maker cap: the tests stress the electrochemistry */
+    config.anode_material_loss = 0.0f;
     return config;
 }
 
@@ -286,11 +287,14 @@ static void test_predicted_overtemperature_limits(void) {
     EvCellConfig config = lgm50_config();
     EvCellState state;
     EvCellPrediction prediction;
-    ev_cell_init(&state, 0.3, 44.0f);
+    ev_cell_init(&state, 0.3, 42.0f);
     (void)ev_predict_cell(&config, &state, 20.0f, HORIZON_S, &prediction);
-    check((prediction.violated & EV_CONSTRAINT_TEMPERATURE_HIGH) != 0U, "thermal: 4C at 44 degC exceeds 45 degC");
+    check((prediction.violated & EV_CONSTRAINT_TEMPERATURE_HIGH) != 0U, "thermal: 4C at 42 degC exceeds 45 degC");
     (void)ev_predict_cell(&config, &state, 0.5f, HORIZON_S, &prediction);
-    check((prediction.violated & EV_CONSTRAINT_TEMPERATURE_HIGH) == 0U, "thermal: 0.1C at 44 degC stays below 45 degC");
+    check((prediction.violated & EV_CONSTRAINT_TEMPERATURE_HIGH) == 0U, "thermal: 0.1C at 42 degC stays below 45 degC");
+    ev_cell_init(&state, 0.3, 43.5f);   /* the sensor may read 2 degC low */
+    (void)ev_predict_cell(&config, &state, 0.5f, HORIZON_S, &prediction);
+    check((prediction.violated & EV_CONSTRAINT_TEMPERATURE_HIGH) != 0U, "thermal: 43.5 degC reading + 2 degC sensor margin is at the limit");
 }
 
 static void test_overtemperature_fault_hysteresis_and_hold(void) {
@@ -1640,6 +1644,117 @@ static void test_restored_state_is_validated(void) {
     check((r.fault_flags & EV_FAULT_STATE) == 0U, "restore: the reset repairs the pack-mismatch timer");
 }
 
+
+/* Round-10 C-safety finding: at a 0 A command the over-current tolerances accept a trickle of
+ * C/50 (C/100 measured, the sensor reading its offset low) that no limit budgets. A cell that
+ * keeps charging past the limits while nothing is approved must fault. */
+static void test_zero_command_trickle_faults(void) {
+    const float offset_A = EV_CURRENT_OFFSET_C_RATE * 5.0f;
+    int trickle;
+    for (trickle = 0; trickle < 2; ++trickle) {
+        Pack pack;
+        EvPackResult r;
+        float command_A = 0.0f;
+        uint16_t flags = 0U;
+        double peak = 0.0;
+        int t;
+        pack_uniform(&pack, 0.90, 25.0f);
+        for (t = 0; t < 10 * 3600; ++t) {
+            float true_A = (command_A > 0.0f) ? command_A : ((trickle != 0) ? (2.0f * offset_A) : 0.0f);
+            float measured_A = (true_A > 0.0f) ? (true_A - offset_A) : 0.0f;
+            plant_step(&pack, true_A, DT_S);
+            r = ev_step(pack.config, pack.state, measured_A, 5.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+            if (((flags & EV_FAULT_OVER_CURRENT) == 0U) && ((r.fault_flags & EV_FAULT_OVER_CURRENT) != 0U)) { peak = pack.true_soc[0]; }
+            flags |= r.fault_flags;
+            command_A = r.approved_charge_current_A;
+        }
+        if (trickle != 0) {
+            /* the fault is the request to open the charge path; this plant keeps trickling */
+            printf("  measured: C/50 trickle at a 0 A command, over-current fault at true SOC %.3f\n", peak);
+            check(((flags & EV_FAULT_OVER_CURRENT) != 0U) && (peak < 1.0), "zero command: a charger that keeps trickling faults before overcharge");
+        } else {
+            check(flags == 0U, "zero command: a full cell at rest does not fault");
+        }
+    }
+}
+
+/* Degradation modes: anode material lost beyond the capacity fade (invisible to SOH) raises the
+ * anode stoichiometry and the interfacial current density; the limit must tighten with it. */
+static void test_anode_material_loss_tightens_limit(void) {
+    EvCellConfig config = lgm50_config();
+    EvCellState state;
+    EvCellPrediction fresh;
+    EvCellPrediction aged;
+    float fresh_A;
+    ev_cell_init(&state, 0.7, 25.0f);
+    state.covariance[0] = 1.0e-6;
+    state.reference_sigma = 1.0e-3;
+    (void)ev_predict_cell(&config, &state, 5.0f, HORIZON_S, &fresh);
+    fresh_A = ev_cell_max_charge_current(&config, &state, 20.0f, HORIZON_S, NULL, NULL);
+    config.anode_material_loss = 0.15f;
+    (void)ev_predict_cell(&config, &state, 5.0f, HORIZON_S, &aged);
+    check(aged.anode_potential_V < fresh.anode_potential_V - 0.005f, "ageing: 15 % anode loss lowers the predicted anode potential");
+    check(ev_cell_max_charge_current(&config, &state, 20.0f, HORIZON_S, NULL, NULL) < 0.95f * fresh_A, "ageing: 15 % anode loss lowers the limit");
+    config.anode_material_loss = 0.6f;
+    check(!ev_config_is_valid(&config), "ageing: anode loss above the maximum is a config fault");
+}
+
+/* Round-10 finding: a steady charge in the 15 %-low-capacity corner relaxed the EKF's polarisation
+ * offset in the window model, a change the plant does not make, and latched a false fault. */
+static void test_tracking_mismatch_at_low_current(void) {
+    double peak;
+    double final_soc;
+    Scenario sc = scenario(0, 0.0f, 0.0f);
+    sc.r0_scale = 0.7f;
+    sc.r1_scale = 0.5f;
+    sc.tau_scale = 0.3f;
+    sc.capacity_scale = 0.85f;
+    sc.request_A = 2.6f;
+    sc.end_s = 4.0f * 3600.0f;
+    check(run_scenario(&sc, &peak, &final_soc) == 0U, "tracking: no false fault at 0.5C in the low-capacity corner");
+}
+
+/* Round-10 finding: a reading that stays suspect while 10 % of the capacity is charged latches,
+ * independently of the mismatch timer; an estimator reset keeps the suspicion. */
+static void test_suspect_charge_latch(void) {
+    Pack pack;
+    EvPackResult r;
+    int i;
+    pack_uniform(&pack, 0.5, 25.0f);
+    plant_step(&pack, 0.0f, DT_S);
+    (void)ev_step(pack.config, pack.state, 0.0f, 0.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    pack.state[2].track_suspect = true;
+    pack.state[2].soc = 2.0;   /* corrupt a numeric field: the estimator resets */
+    r = ev_step(pack.config, pack.state, 0.0f, 0.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    check(((r.fault_flags & EV_FAULT_STATE) != 0U) && pack.state[2].track_suspect, "suspect: an estimator reset keeps a valid suspicion");
+    for (i = 0; i < 3; ++i) {   /* a tracking window is open again */
+        plant_step(&pack, 0.0f, DT_S);
+        (void)ev_step(pack.config, pack.state, 0.0f, 0.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    }
+    pack.state[2].track_suspect = true;
+    pack.state[2].suspect_charge = EV_TRACK_SUSPECT_LATCH_SOC - 1.0e-6;
+    pack.state[2].track_fail_cycles = 0U;
+    plant_step(&pack, 0.2f, DT_S);   /* a small charge: nothing validates the reading */
+    r = ev_step(pack.config, pack.state, 0.2f, 0.0f, pack.voltages_V, pack.temperatures_C, DT_S, HORIZON_S);
+    check(pack.state[2].sensor_fault_latched && ((r.fault_flags & EV_FAULT_VOLTAGE_PLAUSIBILITY) != 0U),
+          "suspect: charge counted while suspect latches the plausibility fault");
+}
+
+/* Round-10 physics finding: after a step down the measured voltage floor must use the smallest
+ * plausible R0, 0.7 x R0 (a larger one predicts too large a drop). */
+static void test_step_down_floor_uses_low_r0(void) {
+    EvCellConfig config = lgm50_config();
+    EvCellState state;
+    EvCellPrediction prediction;
+    ev_cell_init(&state, 0.5, 25.0f);
+    state.covariance[0] = 1.0e-6;
+    state.last_voltage_V = 3.90f;
+    state.last_current_A = 5.0f;
+    (void)ev_predict_cell(&config, &state, 0.0f, HORIZON_S, &prediction);
+    check(prediction.terminal_voltage_V >= 3.90f - (0.7f * config.resistance_ohm * 5.0f) - 1.0e-4f,
+          "voltage floor: a step down drops the floor by at most the smallest plausible R0 step");
+}
+
 /* Round-9 finding: the plant used the controller's own OCV table, so a real cell's OCV that
  * differs from the fitted table was never tested. A healthy cell whose OCV is off by a sinusoidal
  * error over SOC (10 mV over 0.33 SOC, or 5 mV over 0.2 SOC: OCV-slope errors up to about
@@ -1735,6 +1850,11 @@ static bool self_test(void) {
     test_frozen_with_periodic_invalid_samples_latches();
     test_restored_state_is_validated();
     test_ocv_fit_error_does_not_latch();
+    test_zero_command_trickle_faults();
+    test_anode_material_loss_tightens_limit();
+    test_tracking_mismatch_at_low_current();
+    test_suspect_charge_latch();
+    test_step_down_floor_uses_low_r0();
     test_inconsistent_covariance_is_reset();
     test_thermal_prediction_exact_at_equilibrium();
     return g_failures == 0;

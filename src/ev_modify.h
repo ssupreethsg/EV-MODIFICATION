@@ -33,7 +33,7 @@ extern "C" {
 #define EV_MODIFY_VERSION_MAJOR 2   /* library version; CMake checks it against project(VERSION) */
 #define EV_MODIFY_VERSION_MINOR 0
 #define EV_MODIFY_VERSION_PATCH 0
-#define EV_STATE_LAYOUT_VERSION 4U   /* EvCellState.layout_version; changes whenever EvCellState changes */
+#define EV_STATE_LAYOUT_VERSION 5U   /* EvCellState.layout_version; changes whenever EvCellState changes */
 
 /* ---- Physical constants ---------------------------------------------------------------- */
 #define EV_FARADAY_C_PER_MOL 96485.33212f
@@ -70,6 +70,7 @@ extern "C" {
 #define EV_TRACK_VALIDATE_V 0.030f           /* window validated (and restarted) once the reading has moved this much beyond the tolerance, as modelled */
 #define EV_TRACK_SPIKE_V 0.050f              /* consecutive readings further apart than this are not used to (re)start a window */
 #define EV_TRACK_R1_UNCERTAINTY 1.0f         /* relative R1 error allowed for; with any time constant the plant RC voltage lies in [0, (1 + u) R1 dI] */
+#define EV_TRACK_RC_OFFSET_MAX_V 0.020f     /* cap on the EKF polarisation offset whose relaxation the window allows for */
 #define EV_TRACK_TAU_MIN_FACTOR 0.3f        /* the plant RC time constant may be this fraction of the configured one */
 #define EV_TRACK_SOC_BIAS 0.05             /* SOC error beyond the EKF's 3 sigma that resistance errors can cause (R0 +30 %, R1 x2) */
 #define EV_TRACK_CAPACITY_UNCERTAINTY 0.2f   /* relative error of the open-loop OCV change (capacity, OCV slope) */
@@ -77,7 +78,7 @@ extern "C" {
 /* Measured charge current must follow the approved command (charger ignoring the limit). Every
  * limit is computed at the highest current that can flow without a fault: the command plus this
  * tolerance plus the current-sensor offset, so no steady excess the fault logic accepts is
- * unbudgeted. The 2 s ramp-down after a lower command belongs to the previous approval, which was
+ * unbudgeted while a current is approved (at a 0 A command see EV_ZERO_COMMAND_*). The 2 s ramp-down after a lower command belongs to the previous approval, which was
  * checked over at least dt + 2 s. */
 #define EV_OVER_CURRENT_TOLERANCE_C_RATE 0.02f /* allowed excess over the approved current, as a C-rate ... */
 #define EV_OVER_CURRENT_TOLERANCE_REL 0.05f  /* ... plus this fraction of it */
@@ -89,6 +90,10 @@ extern "C" {
 #define EV_SOC_DIVERGENCE_LIMIT 0.02         /* EKF below the coulomb count since the sensor last worked, beyond 3 sigma => fault */
 #define EV_COUNT_CAPACITY_UNCERTAINTY 0.05   /* capacity error of the coulomb count (SOH model) for its lower SOC bound */
 #define EV_SOC_DIVERGENCE_ARM_SIGMA 0.03     /* the divergence check is armed once the EKF SOC sigma is below this */
+/* At a 0 A command (after the ramp-down) a cell above either limit is still being charged: the
+ * charger does not stop => EV_FAULT_OVER_CURRENT. */
+#define EV_ZERO_COMMAND_VOLTAGE_MARGIN_V 0.010f /* measured voltage above EV_MAX_CELL_VOLTAGE_V + this ... */
+#define EV_ZERO_COMMAND_SOC_MARGIN 0.01         /* ... or EKF SOC above EV_MAX_SAFE_SOC + this */
 #define EV_CURRENT_TOLERANCE_A 1.0e-3f
 
 /* ---- Input plausibility (outside => FAULT) ----------------------------------------------- */
@@ -116,6 +121,11 @@ extern "C" {
 #define EV_PARTICLE_RADIUS_M 5.86e-6f
 #define EV_MAX_CONCENTRATION_MOL_M3 33133.0f
 #define EV_SOLID_DIFFUSIVITY_REF_M2_S 3.3e-14f
+/* Published LG M50 graphite diffusivities differ by up to 100x (Chen2020 3.3e-14 m2/s; O'Regan2022
+ * 1e-16 to 2e-14 m2/s, stoichiometry-dependent). The surrogate uses half of Chen2020's value: in
+ * the DFN check this keeps the 5 mV margin for the worst pairing of the two sets (O'Regan2022's
+ * diffusivity with Chen2020's lower exchange current), which Chen2020's value alone does not. */
+#define EV_SOLID_DIFFUSIVITY_UNCERTAINTY 0.5f
 #define EV_ANODE_ACTIVE_FRACTION 0.75f
 /* i0 = k * sqrt(theta * (1 - theta) * c_e / c_e0), k = m_ref * sqrt(c_e0) * c_s_max (Chen2020) */
 #define EV_EXCHANGE_CURRENT_REF_A_M2 0.679f
@@ -172,6 +182,7 @@ extern "C" {
 #define EV_AGING_ACTIVATION_ENERGY_J_MOL 30000.0f
 #define EV_RESISTANCE_GROWTH_PER_LOSS 2.5    /* R0 rises 2.5 x relative capacity loss */
 #define EV_MIN_SOH 0.5
+#define EV_MAX_ANODE_MATERIAL_LOSS 0.5f
 
 /* ---- Types ------------------------------------------------------------------------------- */
 
@@ -186,6 +197,10 @@ typedef struct {
     float coolant_temperature_C;   /* [-40, 100] ambient/coolant temperature */
     float max_charge_current_A;    /* (0, 1000] cell maker's maximum charge current (LG M50: 0.7C); set it from the
                                     * maker's temperature derating when the coolant temperature changes */
+    float anode_material_loss;     /* [0, EV_MAX_ANODE_MATERIAL_LOSS] fraction of graphite capacity lost (LAM_NE), from a
+                                    * degradation-mode diagnostic (dV/dQ or ICA); 0 for a fresh cell. Capacity fade
+                                    * (1 - SOH) is always assumed to be anode loss at least; anode loss beyond it is
+                                    * invisible to SOH and must be measured. */
 } EvCellConfig;
 
 /* Per-cell persistent state. Initialise with ev_cell_init(); afterwards only the library's functions (ev_step(), ev_step_with_pack_voltage(), ev_clear_latched_faults()) write it. */
@@ -212,6 +227,8 @@ typedef struct {
     float track_start_current_A;   /* current at the start of the window */
     float track_step_filtered_A;   /* |current - start current| filtered with the fastest plausible RC time constant */
     float track_prior_step_A;      /* recent steps before the window started, decaying with the RC time constant */
+    float track_rc_offset_V;       /* EKF polarisation voltage at the window start beyond what recent current steps explain */
+    float track_rc_relaxed_V;      /* part of that offset the window model has relaxed so far (allowed for) */
     float recent_current_step_A;   /* current steps decaying with the RC time constant (RC transients in progress) */
     uint16_t track_fail_cycles;    /* consecutive cycles with a mismatch above EV_TRACK_FAULT_V */
     float track_fail_time_s;       /* time since the first of those cycles (latched at EV_TRACK_FAULT_CONFIRM_S) */
@@ -325,7 +342,8 @@ bool ev_config_is_valid(const EvCellConfig *config);
  *  2. update every cell estimate (EKF, temperature, ageing) with those measurements;
  *  3. apply fault detection with hysteresis and hold;
  *  4. return the largest charge current <= request that keeps every cell inside all
- *     constraints for max(prediction_horizon_s, control_dt_s).
+ *     constraints for max(prediction_horizon_s, EV_MAX_CONTROL_DT_S + EV_OVER_CURRENT_RAMP_S):
+ *     the approval stays in force until the next call and the charger's ramp-down after it.
  * State is updated even on FAULT so that estimates keep tracking; when the current or dt
  * measurement itself is invalid the SOC mean is kept and its variance is inflated instead.
  */

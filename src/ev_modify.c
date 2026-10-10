@@ -181,7 +181,8 @@ bool ev_config_is_valid(const EvCellConfig *config) {
         && ev_in_range(config->heat_transfer_W_m2_K, 1.0f, 1000.0f)
         && ev_in_range(config->heat_capacity_J_kg_K, 100.0f, 5000.0f)
         && ev_in_range(config->coolant_temperature_C, EV_MIN_PLAUSIBLE_TEMPERATURE_C, EV_MAX_PLAUSIBLE_TEMPERATURE_C)
-        && ev_in_range(config->max_charge_current_A, FLT_MIN, EV_MAX_PLAUSIBLE_CURRENT_A);
+        && ev_in_range(config->max_charge_current_A, FLT_MIN, EV_MAX_PLAUSIBLE_CURRENT_A)
+        && ev_in_range(config->anode_material_loss, 0.0f, EV_MAX_ANODE_MATERIAL_LOSS);
 }
 
 /* A restored bool may hold any byte; reading a value other than 0 or 1 as bool is undefined. */
@@ -223,6 +224,8 @@ static bool ev_state_is_valid(const EvCellState *state) {
         && ev_in_range(state->track_start_current_A, -EV_MAX_PLAUSIBLE_CURRENT_A, EV_MAX_PLAUSIBLE_CURRENT_A)
         && ev_in_range(state->track_step_filtered_A, 0.0f, 2.0f * EV_MAX_PLAUSIBLE_CURRENT_A)
         && ev_in_range(state->track_prior_step_A, 0.0f, 2.0f * EV_MAX_PLAUSIBLE_CURRENT_A)
+        && ev_in_range(state->track_rc_offset_V, 0.0f, EV_TRACK_RC_OFFSET_MAX_V)
+        && ev_in_range(state->track_rc_relaxed_V, 0.0f, (float)EV_MAX_RC_VOLTAGE_V)
         && ev_in_range(state->recent_current_step_A, 0.0f, 2.0f * EV_MAX_PLAUSIBLE_CURRENT_A)
         && ev_in_range(state->track_rc_voltage_V, (float)-EV_MAX_RC_VOLTAGE_V, (float)EV_MAX_RC_VOLTAGE_V)
         && ev_in_range_d(state->track_soc, 0.0, 1.0)
@@ -240,6 +243,13 @@ static bool ev_state_is_valid(const EvCellState *state) {
         && ev_in_range(state->invalid_voltage_score, 0.0f, FLT_MAX)
         && ev_in_range_d(state->suspect_charge, 0.0, DBL_MAX)
         && (state->fault_hold_cycles <= (uint16_t)EV_FAULT_HOLD_CYCLES);
+}
+
+/* Restart the coulomb count from the EKF: the reading has just been shown to track the model. */
+static void ev_anchor_reference(EvCellState *state) {
+    state->reference_soc = state->soc;
+    state->reference_sigma = sqrt(state->covariance[0]);
+    state->reference_throughput = 0.0;
 }
 
 void ev_clear_latched_faults(EvCellState *state) {
@@ -264,9 +274,7 @@ void ev_clear_latched_faults(EvCellState *state) {
     /* The SOC estimate may have followed the faulty reading: it is re-learned from the repaired one. */
     state->covariance[0] = EV_MAX_SOC_VARIANCE;
     state->covariance[1] = 0.0;
-    state->reference_soc = state->soc;
-    state->reference_sigma = sqrt(state->covariance[0]);
-    state->reference_throughput = 0.0;
+    ev_anchor_reference(state);
 }
 
 void ev_cell_init(EvCellState *state, double initial_soc, float initial_temperature_C) {
@@ -288,9 +296,7 @@ void ev_cell_init(EvCellState *state, double initial_soc, float initial_temperat
     state->last_current_A = 0.0f;
     state->innovation_fail_cycles = 0U;
     state->track_soc = state->soc;
-    state->reference_soc = state->soc;
-    state->reference_sigma = sqrt(state->covariance[0]);
-    state->reference_throughput = 0.0;
+    ev_anchor_reference(state);
     state->soc_divergence = false;
     state->sensor_fault_latched = false;
     state->fault_hold_cycles = 0U;
@@ -329,13 +335,17 @@ static void ev_reset_estimator(EvCellState *state) {
     state->track_start_soc = state->soc;
     state->track_start_current_A = 0.0f;
     state->track_step_filtered_A = 0.0f;
+    state->track_rc_offset_V = 0.0f;
+    state->track_rc_relaxed_V = 0.0f;
     state->track_prior_step_A = 0.0f;
     state->recent_current_step_A = 0.0f;   /* last current is reset to 0, so the next step counts in full */
     state->track_fail_cycles = 0U;
     state->track_fail_time_s = 0.0f;
     state->rest_time_s = 0.0f;
-    state->track_suspect = false;
-    state->suspect_charge = 0.0;
+    /* A reading under suspicion stays suspect: with the reset SOC sigma the EKF would otherwise
+     * re-learn the SOC from it. A corrupted flag byte is read as set. */
+    if (!ev_bool_byte_ok(&state->track_suspect)) { state->track_suspect = true; }
+    if (!ev_in_range_d(state->suspect_charge, 0.0, DBL_MAX)) { state->suspect_charge = 0.0; }
     /* A corrupted flag byte is read as set, the fail-safe value of every flag (latches, blocks). */
     if (!ev_bool_byte_ok(&state->soc_divergence)) { state->soc_divergence = true; }
     if (!ev_bool_byte_ok(&state->sensor_fault_latched)) { state->sensor_fault_latched = true; }
@@ -349,9 +359,7 @@ static void ev_reset_estimator(EvCellState *state) {
     if (state->fault_hold_cycles > (uint16_t)EV_FAULT_HOLD_CYCLES) { state->fault_hold_cycles = (uint16_t)EV_FAULT_HOLD_CYCLES; }
     /* SOC unknown: the coulomb-count reference restarts with the reset uncertainty. A latched
      * divergence is kept (ev_cell_init() clears it). */
-    state->reference_soc = state->soc;
-    state->reference_sigma = sqrt(state->covariance[0]);
-    state->reference_throughput = 0.0;
+    ev_anchor_reference(state);
     if (!ev_in_range(state->excess_charge_Ah, 0.0f, FLT_MAX)) { state->excess_charge_Ah = FLT_MAX; }
     /* Unknown command history: allow nothing beyond the tolerance from now on. */
     state->commanded_current_A = 0.0f;
@@ -399,7 +407,7 @@ static float ev_predict_temperature_C(const EvCellConfig *config, float start_te
 }
 
 static float ev_solid_diffusivity_m2_s(float temperature_K) {
-    return EV_SOLID_DIFFUSIVITY_REF_M2_S
+    return EV_SOLID_DIFFUSIVITY_REF_M2_S * EV_SOLID_DIFFUSIVITY_UNCERTAINTY
         * ev_arrhenius((temperature_K < EV_REFERENCE_TEMPERATURE_K) ? EV_DIFFUSION_ACTIVATION_ENERGY_COLD_J_MOL
                                                                      : EV_DIFFUSION_ACTIVATION_ENERGY_WARM_J_MOL, temperature_K);
 }
@@ -470,15 +478,15 @@ bool ev_predict_cell(const EvCellConfig *config, const EvCellState *state, float
     float r0_ohm = ev_effective_r0(config, state, model_C);
     float r1_ohm = ev_effective_r1(config, model_C);
 
-    /* SOC at the end of the horizon, as a 3-sigma upper bound. It is never below the lower bound
-     * of the coulomb count since the voltage reading was last shown to track the model, so a
-     * reading that froze, drifted or stepped after that cannot talk the estimate down by more
-     * than the count's own uncertainty (anchor sigma and a capacity error on the charge since). */
+    /* SOC at the end of the horizon, as a 3-sigma upper bound. It is never
+     * below the lower bound of the coulomb count since the voltage reading was last shown to track
+     * the model, so a reading that froze, drifted or stepped after that cannot talk the estimate
+     * down by more than the count's own uncertainty. */
     double capacity_Ah = (double)config->nominal_capacity_Ah * state->soh;
+    double horizon_soc = ((double)charge_current_A * (double)horizon_s) / (capacity_Ah * 3600.0);
     double count_lower = state->reference_soc - (EV_SOC_SIGMA_MULTIPLIER * state->reference_sigma)
         - (EV_COUNT_CAPACITY_UNCERTAINTY * state->reference_throughput);
-    double soc_upper = fmax(state->soc + (EV_SOC_SIGMA_MULTIPLIER * sqrt(state->covariance[0])), count_lower)
-        + (((double)charge_current_A * (double)horizon_s) / (capacity_Ah * 3600.0));
+    double soc_upper = fmax(state->soc + (EV_SOC_SIGMA_MULTIPLIER * sqrt(state->covariance[0])), count_lower) + horizon_soc;
     prediction->predicted_soc = (float)soc_upper;
 
     /* Terminal voltage bound over the whole horizon: OCV rises monotonically with SOC and the RC
@@ -498,7 +506,12 @@ bool ev_predict_cell(const EvCellConfig *config, const EvCellState *state, float
         double soc_nominal_end = state->soc + (((double)charge_current_A * (double)horizon_s) / (capacity_Ah * 3600.0));
         ev_full_cell_ocv_V_and_dv_dsoc((float)state->soc, &ocv_now_V, NULL);
         ev_full_cell_ocv_V_and_dv_dsoc((float)ev_clamp_d(soc_nominal_end, 0.0, 1.0), &ocv_nominal_end_V, NULL);
-        measured_bound_V = state->last_voltage_V + (r0_ohm * (charge_current_A - state->last_current_A))
+        /* A step down lowers the voltage least with the smallest plausible R0. */
+        float step_A = charge_current_A - state->last_current_A;
+        float step_r0_ohm = (step_A >= 0.0f) ? r0_ohm
+            : ((1.0f - (float)EV_RESISTANCE_UNCERTAINTY)
+               * ev_effective_r0(config, state, state->temperature_C + EV_TEMPERATURE_SENSOR_MARGIN_C));   /* cell may be warmer */
+        measured_bound_V = state->last_voltage_V + (step_r0_ohm * step_A)
             + fmaxf(ocv_nominal_end_V - ocv_now_V, 0.0f) + fmaxf(rc_end_V - state->rc_voltage_V, 0.0f);
     }
     prediction->terminal_voltage_V = fmaxf(model_bound_V, measured_bound_V);
@@ -518,14 +531,21 @@ bool ev_predict_cell(const EvCellConfig *config, const EvCellState *state, float
     float solid_gradient_density_A_m2 = fmaxf(charge_current_A, state->solid_history_current_A) / area_m2;
     float electrolyte_gradient_density_A_m2 = fmaxf(charge_current_A, state->electrolyte_history_current_A) / area_m2;
     float specific_area_m_inv = (3.0f * EV_ANODE_ACTIVE_FRACTION) / EV_PARTICLE_RADIUS_M;
-    float interfacial_current_A_m2 = current_density_A_m2 / (specific_area_m_inv * EV_ANODE_THICKNESS_M * (float)state->soh);
-    float gradient_interfacial_A_m2 = solid_gradient_density_A_m2 / (specific_area_m_inv * EV_ANODE_THICKNESS_M * (float)state->soh);
+    /* Anode active material left: at most the capacity retention (fade treated as anode loss),
+     * less if a diagnostic measured more anode loss than capacity loss. */
+    float anode_left = fminf((float)state->soh, 1.0f - config->anode_material_loss);
+    float interfacial_current_A_m2 = current_density_A_m2 / (specific_area_m_inv * EV_ANODE_THICKNESS_M * anode_left);
+    float gradient_interfacial_A_m2 = solid_gradient_density_A_m2 / (specific_area_m_inv * EV_ANODE_THICKNESS_M * anode_left);
     float solid_diffusivity_m2_s = ev_solid_diffusivity_m2_s(temperature_K);
     float surface_stoich_rise = (gradient_interfacial_A_m2 * EV_PARTICLE_RADIUS_M)
         / (5.0f * EV_FARADAY_C_PER_MOL * solid_diffusivity_m2_s * EV_MAX_CONCENTRATION_MOL_M3);
-    /* The OCP table ends at SOC 1; a surface beyond it is lithiated past the window (lower OCP,
-     * plating-prone) and is a violation. i0 uses the unclamped stoichiometry. */
-    float surface_soc_unclamped = (float)ev_clamp_d(soc_upper, 0.0, 1.0) + (surface_stoich_rise / anode_stoich_window);
+    /* Bulk stoichiometry of an aged anode: (x0 + SOC * window * SOH) / (anode left) bounds it for
+     * any mix of lithium loss and anode loss at any lithiation (fresh cell: x0 + SOC * window).
+     * The OCP table is indexed by fresh SOC and ends at SOC 1; a surface beyond it is lithiated
+     * past the window (lower OCP, plating-prone) and is a violation. i0 uses the unclamped value. */
+    float bulk_stoich = (EV_ANODE_STOICH_AT_SOC0
+        + ((float)ev_clamp_d(soc_upper, 0.0, 1.0) * anode_stoich_window * (float)state->soh)) / anode_left;
+    float surface_soc_unclamped = ((bulk_stoich - EV_ANODE_STOICH_AT_SOC0) + surface_stoich_rise) / anode_stoich_window;
     float surface_soc = ev_clamp(surface_soc_unclamped, 0.0f, 1.0f);
     float surface_stoich = ev_clamp(EV_ANODE_STOICH_AT_SOC0 + (surface_soc_unclamped * anode_stoich_window), 0.001f, 0.999f);
 
@@ -574,7 +594,9 @@ bool ev_predict_cell(const EvCellConfig *config, const EvCellState *state, float
     if (soc_upper > (double)EV_MAX_SAFE_SOC) { violated |= EV_CONSTRAINT_SOC; }
     if (charge_current_A > config->max_charge_current_A) { violated |= EV_CONSTRAINT_CURRENT_LIMIT; }
     if ((charge_current_A > 0.0f) && (surface_soc_unclamped >= 1.0f)) { violated |= EV_CONSTRAINT_ANODE_POTENTIAL; }
-    if (prediction->predicted_temperature_C > EV_MAX_CELL_TEMPERATURE_C) { violated |= EV_CONSTRAINT_TEMPERATURE_HIGH; }
+    if ((prediction->predicted_temperature_C + EV_TEMPERATURE_SENSOR_MARGIN_C) > EV_MAX_CELL_TEMPERATURE_C) {
+        violated |= EV_CONSTRAINT_TEMPERATURE_HIGH;   /* the sensor may read the margin low */
+    }
     if ((charge_current_A > 0.0f)
         && (state->cold_charge_block || ((coldest_C - EV_TEMPERATURE_SENSOR_MARGIN_C) < EV_MIN_CHARGE_TEMPERATURE_C))) {
         violated |= EV_CONSTRAINT_TEMPERATURE_LOW;
@@ -716,21 +738,29 @@ static void ev_update_ageing(const EvCellConfig *config, EvCellState *state, flo
     state->soh = new_soh;
 }
 
-/* Largest change of OCV(to) - OCV(from) when both SOCs are shifted by up to +/- shift. */
+/* Largest change of OCV(to) - OCV(from) when the window start is shifted by up to +/- shift and
+ * the SOC it covers is scaled by 1 +/- EV_TRACK_CAPACITY_UNCERTAINTY (a capacity error carries
+ * the true cell further along the OCV curve, which matters where its slope changes). */
 
 static float ev_ocv_change_spread_V(double from_soc, double to_soc, double shift) {
+    static const double scales[3] = {1.0 - (double)EV_TRACK_CAPACITY_UNCERTAINTY, 1.0, 1.0 + (double)EV_TRACK_CAPACITY_UNCERTAINTY};
+    double moved = to_soc - from_soc;
     float base_from = 0.0f;
     float base_to = 0.0f;
     float spread = 0.0f;
     int side;
+    size_t k;
     ev_full_cell_ocv_V_and_dv_dsoc((float)from_soc, &base_from, NULL);
     ev_full_cell_ocv_V_and_dv_dsoc((float)to_soc, &base_to, NULL);
-    for (side = -1; side <= 1; side += 2) {
+    for (side = -1; side <= 1; ++side) {
+        double start_soc = ev_clamp_d(from_soc + ((double)side * shift), 0.0, 1.0);
         float from = 0.0f;
-        float to = 0.0f;
-        ev_full_cell_ocv_V_and_dv_dsoc((float)ev_clamp_d(from_soc + ((double)side * shift), 0.0, 1.0), &from, NULL);
-        ev_full_cell_ocv_V_and_dv_dsoc((float)ev_clamp_d(to_soc + ((double)side * shift), 0.0, 1.0), &to, NULL);
-        spread = fmaxf(spread, fabsf((to - from) - (base_to - base_from)));
+        ev_full_cell_ocv_V_and_dv_dsoc((float)start_soc, &from, NULL);
+        for (k = 0U; k < (sizeof(scales) / sizeof(scales[0])); ++k) {
+            float to = 0.0f;
+            ev_full_cell_ocv_V_and_dv_dsoc((float)ev_clamp_d(start_soc + (scales[k] * moved), 0.0, 1.0), &to, NULL);
+            spread = fmaxf(spread, fabsf((to - from) - (base_to - base_from)));
+        }
     }
     return spread;
 }
@@ -749,6 +779,12 @@ static void ev_propagate_tracking_window(const EvCellConfig *config, EvCellState
     state->track_step_filtered_A = (a_fast * state->track_step_filtered_A)
         + ((1.0f - a_fast) * fminf(fabsf(current_A - state->track_start_current_A), 2.0f * EV_MAX_PLAUSIBLE_CURRENT_A));
     state->track_prior_step_A *= expf(-dt_s / config->rc_time_constant_s);
+    /* The EKF's polarisation voltage at the window start also absorbs other model errors (capacity,
+     * R1), and the open-loop model relaxes that offset from R1 * I with its time constant: a change
+     * the plant need not make. The part relaxed so far is allowed for; it starts at zero, so a step
+     * or a frozen reading is still seen at once. The offset is what recent current steps cannot
+     * explain (EV_TRACK_R1_UNCERTAINTY), set when the window starts. */
+    state->track_rc_relaxed_V += (float)(1.0 - a) * fmaxf(state->track_rc_offset_V - state->track_rc_relaxed_V, 0.0f);
 }
 
 /* Voltage-tracking check, run before the EKF update. Over a window the open-loop model is
@@ -809,7 +845,7 @@ static bool ev_voltage_tracking_suspect(const EvCellConfig *config, EvCellState 
     r0_tolerance_V = (float)EV_RESISTANCE_UNCERTAINTY * r0_ohm * fabsf(current_A - state->track_start_current_A);
     tolerance_V = r0_tolerance_V
         + ((1.0f + EV_TRACK_R1_UNCERTAINTY) * r1_ohm * fmaxf(state->track_step_filtered_A, state->track_prior_step_A))
-        + (EV_TRACK_CAPACITY_UNCERTAINTY * fabsf(ocv - state->track_start_ocv_V))
+        + state->track_rc_relaxed_V
         + ev_ocv_change_spread_V(state->track_start_soc, state->track_soc,
                                  (EV_SOC_SIGMA_MULTIPLIER * sqrt(state->covariance[0])) + EV_TRACK_SOC_BIAS);
     mismatch_V = fabsf(measured_change_V - expected_change_V) - tolerance_V;
@@ -852,16 +888,13 @@ static void ev_start_tracking_window(const EvCellConfig *config, EvCellState *st
     state->track_start_model_V = ocv + state->rc_voltage_V + (ev_effective_r0(config, state, state->temperature_C) * current_A);
     state->track_start_current_A = current_A;
     state->track_step_filtered_A = 0.0f;
+    state->track_rc_offset_V = ev_clamp(fabsf(state->rc_voltage_V - (ev_effective_r1(config, state->temperature_C) * current_A))
+        - ((1.0f + EV_TRACK_R1_UNCERTAINTY) * ev_effective_r1(config, state->temperature_C) * state->recent_current_step_A),
+        0.0f, EV_TRACK_RC_OFFSET_MAX_V);   /* a fault the EKF absorbed cannot widen it further */
+    state->track_rc_relaxed_V = 0.0f;
     state->track_prior_step_A = state->recent_current_step_A;
     state->track_fail_cycles = 0U;
     state->track_fail_time_s = 0.0f;
-}
-
-/* Restarts the coulomb-count reference at the EKF estimate (the reading was just shown to work). */
-static void ev_anchor_reference(EvCellState *state) {
-    state->reference_soc = state->soc;
-    state->reference_sigma = sqrt(state->covariance[0]);
-    state->reference_throughput = 0.0;
 }
 
 /* Mean current the charger should deliver over the interval: the previous command plus a
@@ -1088,6 +1121,16 @@ static uint16_t ev_update_cell(const EvCellConfig *config, EvCellState *state, f
         state->over_current_time_s = 0.0f;
     }
     if (state->over_current_time_s >= EV_OVER_CURRENT_CONFIRM_S) { flags |= EV_FAULT_OVER_CURRENT; }
+    /* At a 0 A command the tolerances above accept a trickle of up to C/50 (C/100 measured with
+     * the sensor reading its offset low) that no limit budgets. A cell that charges past the
+     * limits while nothing is approved has a charger that does not stop. */
+    if ((state->commanded_current_A <= 0.0f) && (ev_expected_current_A(state, dt_s) <= 0.0f)
+        && ((voltage_valid && (voltage_V > (EV_MAX_CELL_VOLTAGE_V + EV_ZERO_COMMAND_VOLTAGE_MARGIN_V)))
+            || (state->soc > ((double)EV_MAX_SAFE_SOC + EV_ZERO_COMMAND_SOC_MARGIN))
+            || ((state->reference_soc - (EV_SOC_SIGMA_MULTIPLIER * state->reference_sigma)
+                 - (EV_COUNT_CAPACITY_UNCERTAINTY * state->reference_throughput)) > ((double)EV_MAX_SAFE_SOC + EV_ZERO_COMMAND_SOC_MARGIN)))) {
+        flags |= EV_FAULT_OVER_CURRENT;
+    }
 
     if ((state->temperature_C - EV_TEMPERATURE_SENSOR_MARGIN_C) < EV_MIN_CHARGE_TEMPERATURE_C) {
         state->cold_charge_block = true;
@@ -1258,9 +1301,10 @@ static EvPackResult ev_step_unrecorded(const EvCellConfig config[EV_NUM_CELLS], 
         return result;
     }
 
-    /* The approved current flows for at least one control period. */
+    /* The approved current flows until the next call (at most EV_MAX_CONTROL_DT_S later) and, after
+     * a lower command, for the charger's ramp-down time beyond it. */
     result.approved_charge_current_A = ev_find_safe_charge_current(config, state, (uint8_t)EV_NUM_CELLS,
-        result.requested_charge_current_A, fmaxf(prediction_horizon_s, control_dt_s + EV_OVER_CURRENT_RAMP_S),
+        result.requested_charge_current_A, fmaxf(prediction_horizon_s, EV_MAX_CONTROL_DT_S + EV_OVER_CURRENT_RAMP_S),
         &limiting_index, &limiting_constraints, &limiting_prediction);
     result.limiting_cell_index = limiting_index;
     result.limiting_anode_potential_V = limiting_prediction.anode_potential_V;

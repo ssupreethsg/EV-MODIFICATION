@@ -146,6 +146,7 @@ static int ev_parse_config(char *argv[], float coolant_temperature_C, EvCellConf
     config->coolant_temperature_C = coolant_temperature_C;
     /* No maker cap: the validation stresses the electrochemical limits (a product sets 0.7C for the LG M50). */
     config->max_charge_current_A = EV_MAX_PLAUSIBLE_CURRENT_A;
+    config->anode_material_loss = 0.0f;
     if (!ev_config_is_valid(config)) {
         fprintf(stderr, "cell parameters out of range\n");
         return 2;
