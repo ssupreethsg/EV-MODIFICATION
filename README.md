@@ -1,7 +1,7 @@
 # EV MODIFY
 
 **Copyright (c) 2026 Supreeth S G. All rights reserved.**
-**License:** proprietary, see [`LICENSE`](LICENSE). The code may be viewed. Building, running, modifying or any other use requires the author's prior written permission. The build instructions below are for permitted users.
+**License:** non-commercial, see [`LICENSE`](LICENSE). You may view, build, run, modify and share the code for personal, academic and research use, with attribution. Commercial use needs a separate written licence from the author.
 
 EV MODIFY is a C11 battery-management function that limits the charge current of a series lithium-ion module. The limit is conservative and based on physics. Every control cycle it:
 

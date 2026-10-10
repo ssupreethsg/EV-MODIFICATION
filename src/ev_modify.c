@@ -1,6 +1,6 @@
 /*
  * EV MODIFY - conservative charge-current limiter.
- * Copyright (c) 2026 Supreeth S G. All rights reserved. See LICENSE.
+ * Copyright (c) 2026 Supreeth S G. Non-commercial licence, see LICENSE.
  */
 
 #include <float.h>

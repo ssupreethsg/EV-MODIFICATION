@@ -1,19 +1,38 @@
-PROPRIETARY LICENSE
+EV MODIFY LICENSE (non-commercial)
 
-Copyright (c) 2026 Supreeth S G. All rights reserved.
+Copyright (c) 2026 Supreeth S G. All rights reserved except as granted below.
 
-This software, including all associated documentation, source code, and algorithms (collectively, the "Software"), is the exclusive and proprietary intellectual property of Supreeth S G.
+"Software" means the source code, documentation, algorithms and other files in
+this repository.
 
-1. VIEWING & APPRECIATION: You are granted a limited, non-exclusive license to view the Software codebase publicly for educational, non-commercial purposes, and to appreciate the architecture. 
+1. NON-COMMERCIAL USE IS ALLOWED. Anyone may view, download, compile, run,
+   test and modify the Software for personal, academic, educational or
+   research purposes that are not commercial.
 
-2. USE & EXECUTION: You may NOT use, run, modify, compile, or execute the Software for any purpose (personal, academic, or commercial) without explicit, prior written permission from the Author.
+2. SHARING. You may fork the Software on GitHub as GitHub's Terms of Service
+   allow. You may share the Software and your modifications for
+   non-commercial purposes only. Every copy must include this LICENSE file
+   unchanged and must keep the copyright notices. A modified copy must say
+   clearly that it has been changed.
 
-3. COMMERCIAL PROHIBITION: No commercial use, integration, productization, or derivation of this Software is permitted under any circumstances. This restriction applies strictly to all entities, including but not limited to corporations, startups, and Tier-1 automotive suppliers. If you wish to use this software in a product, you must negotiate a commercial license agreement directly with the Author.
+3. ATTRIBUTION. Any publication, report, thesis or presentation that uses the
+   Software, or results obtained with it, must credit "EV MODIFY by
+   Supreeth S G".
 
-4. REDISTRIBUTION: You may NOT distribute, sublicense, rent, lease, or lend the Software.
+4. COMMERCIAL USE NEEDS A SEPARATE LICENCE. Commercial use is not granted by
+   this licence. Commercial use includes any use in or for a product or
+   service that is sold or offered for sale, any use in a company's internal
+   development, testing or production, and any paid consulting work. It
+   requires a separate written licence agreement with the Author. Contact the
+   Author through the GitHub profile of the repository owner.
 
-5. ATTRIBUTION: If explicit permission is granted for any use case, you must clearly attribute the original Author (Supreeth S G) in all copies, derivatives, and associated documentation.
+5. NO SAFETY CERTIFICATION. The Software has not been certified to any
+   functional-safety standard (for example ISO 26262). Using it to control a
+   real battery is at your own risk.
 
-This Software is provided "AS IS", without warranty of any kind, express or implied. In no event shall the Author be liable for any claim, damages, or other liability arising from, out of or in connection with the Software.
+6. NO WARRANTY. The Software is provided "AS IS", without warranty of any
+   kind, express or implied. In no event shall the Author be liable for any
+   claim, damages or other liability arising from, out of or in connection
+   with the Software or its use.
 
-For all permissions, exemptions, and commercial licensing inquiries, contact the Author directly.
+Any use not allowed above requires the Author's prior written permission.
